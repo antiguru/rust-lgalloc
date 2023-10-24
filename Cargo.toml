@@ -1,0 +1,22 @@
+[package]
+name = "rust-lgalloc"
+version = "0.1.0"
+edition = "2021"
+authors = ["Moritz Hoffmann <antiguru@gmail.com>"]
+description = "Large object allocator"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/antiguru/rust-lgalloc"
+rust-version = "1.72"
+
+[dependencies]
+crossbeam-deque = "0.8"
+libc = "0.2.149"
+memmap2 = "0.9"
+tempfile = "3.8"
+thiserror = "1.0"
+
+[profile.bench]
+debug = 1
+codegen-units = 1
+lto = true
