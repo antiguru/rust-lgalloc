@@ -12,9 +12,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::take;
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, Range};
 use std::os::fd::{AsFd, AsRawFd};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread::{spawn, JoinHandle, ThreadId};
 use std::time::Duration;
@@ -32,11 +31,8 @@ const LOCAL_BUFFER: usize = 32;
 // Initial file size
 const INITIAL_SIZE: usize = 32 << 20;
 
-/// Largest supported object size class.
-pub const MAX_SIZE_CLASS: usize = 32;
-
-/// Smallest supported object size class. Corresponds to 4KiB.
-pub const MIN_SIZE_CLASS: usize = 12;
+/// Range of valid size classes.
+pub const VALID_SIZE_CLASS: Range<usize> = 16..33;
 
 /// Allocation errors
 #[derive(Error, Debug)]
@@ -47,6 +43,50 @@ pub enum AllocError {
     /// Out of memory, meaning that the pool is exhausted.
     #[error("Out of memory")]
     OutOfMemory,
+    /// Size class too large or small
+    #[error("Invalid size class")]
+    InvalidSizeClass,
+}
+
+struct SizeClass(usize);
+
+impl SizeClass {
+    #[inline]
+    fn new_unchecked(value: usize) -> Self {
+        Self(value)
+    }
+
+    #[inline]
+    fn index(&self) -> usize {
+        self.0 - VALID_SIZE_CLASS.start
+    }
+
+    #[inline]
+    fn from_index(index: usize) -> Self {
+        Self(index + VALID_SIZE_CLASS.start)
+    }
+}
+
+impl TryFrom<usize> for SizeClass {
+    type Error = AllocError;
+
+    #[inline]
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        if VALID_SIZE_CLASS.contains(&value) {
+            Ok(SizeClass(value))
+        } else {
+            Err(AllocError::InvalidSizeClass)
+        }
+    }
+}
+
+impl Deref for SizeClass {
+    type Target = usize;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// Handle to the shared global state.
@@ -66,6 +106,8 @@ struct SizeClassState {
     areas: RwLock<Vec<MmapMut>>,
     /// Injector to distribute memory globally.
     injector: Injector<Mem>,
+    /// Injector to distribute memory globally, freed memory.
+    clean_injector: Injector<Mem>,
     /// Slow-path lock to refill pool.
     lock: Mutex<()>,
     /// Thread stealers to allow all participating threads to steal memory.
@@ -80,17 +122,49 @@ impl GlobalStealer {
 
     /// Obtain the per-size-class global state.
     fn get_size_class(&self, size_class: usize) -> &SizeClassState {
-        &self.size_classes[size_class]
+        let size_class = SizeClass::new_unchecked(size_class);
+        &self.size_classes[size_class.index()]
     }
 
     fn new() -> Self {
-        let mut size_classes = Vec::with_capacity(MAX_SIZE_CLASS + 1);
+        let mut size_classes = Vec::with_capacity(VALID_SIZE_CLASS.len());
 
-        for _ in 0..=MAX_SIZE_CLASS {
+        for _ in VALID_SIZE_CLASS {
             size_classes.push(SizeClassState::default());
         }
 
         Self { size_classes }
+    }
+
+    /// Print diagnostics about the state of the allocator.
+    #[allow(unused)]
+    fn diagnostics(&self) {
+        for (index, size_class_state) in self.size_classes.iter().enumerate() {
+            let size_class = SizeClass::from_index(index);
+            let areas = size_class_state.areas.read().unwrap();
+            if !areas.is_empty() {
+                let total: usize = areas.iter().map(|area| area.len()).sum();
+                let injector_len = size_class_state.injector.len();
+                let clean_len = size_class_state.clean_injector.len();
+                let mut free_areas = injector_len + clean_len;
+                eprintln!(
+                    "Size class {index} ({}) areas: {} global: {injector_len} chunks -clean: {clean_len} chunks",
+                    1 << *size_class,
+                    areas.len()
+                );
+                let stealers = size_class_state.stealers.read().unwrap();
+                for (thread, stealer) in &*stealers {
+                    let stealer_len = stealer.len();
+                    free_areas += stealer_len;
+                    eprintln!("  {thread:?} {stealer_len}");
+                }
+                eprintln!(
+                    "  free info: {}/{total} bytes, {free_areas}/{} chunks",
+                    free_areas * (1 << *size_class),
+                    total / (1 << *size_class)
+                );
+            }
+        }
     }
 }
 
@@ -103,34 +177,31 @@ impl Drop for GlobalStealer {
 /// Per-thread and state, sharded by size class.
 struct ThreadLocalStealer {
     /// Per-size-class state
-    size_class: Vec<LocalSizeClass>,
-    /// The owning thread ID, used for cleaning up global state.
-    thread_id: ThreadId,
+    size_classes: Vec<LocalSizeClass>,
 }
 
 impl ThreadLocalStealer {
     fn new() -> Self {
         let thread_id = std::thread::current().id();
-        Self {
-            size_class: vec![],
-            thread_id,
-        }
+        let size_classes = VALID_SIZE_CLASS
+            .map(|size_class| LocalSizeClass::new(size_class, thread_id))
+            .collect();
+        Self { size_classes }
     }
 
     #[inline]
     fn get(&mut self, size_class: usize) -> Result<Mem, AllocError> {
-        while self.size_class.len() <= size_class {
-            self.size_class
-                .push(LocalSizeClass::new(self.size_class.len(), self.thread_id));
-        }
+        let size_class: SizeClass = size_class.try_into()?;
 
-        self.size_class[size_class].get_with_refill()
+        self.size_classes[size_class.index()].get_with_refill()
     }
 
     #[inline]
     fn push(&self, mem: Mem) {
-        let size_class = mem.len().next_power_of_two().trailing_zeros() as usize;
-        self.size_class[size_class].push(mem);
+        let size_class =
+            SizeClass::new_unchecked(mem.len().next_power_of_two().trailing_zeros() as usize);
+
+        self.size_classes[size_class.index()].push(mem);
     }
 }
 
@@ -178,9 +249,19 @@ impl LocalSizeClass {
             .pop()
             .or_else(|| {
                 std::iter::repeat_with(|| {
+                    // The loop tries to obtain memory in the following order:
+                    // 1. Memory from the global state,
+                    // 2. Memory from the global cleaned state,
+                    // 3. Memory from other threads.
+
                     self.size_class_state
                         .injector
                         .steal_batch_with_limit_and_pop(&self.worker, LOCAL_BUFFER / 2)
+                        .or_else(|| {
+                            self.size_class_state
+                                .clean_injector
+                                .steal_batch_with_limit_and_pop(&self.worker, LOCAL_BUFFER / 2)
+                        })
                         .or_else(|| {
                             self.size_class_state
                                 .stealers
@@ -220,7 +301,7 @@ impl LocalSizeClass {
     #[inline]
     fn push(&self, mem: Mem) {
         debug_assert_eq!(mem.len(), 1 << self.size_class);
-        if self.worker.len() > LOCAL_BUFFER {
+        if self.worker.len() >= LOCAL_BUFFER {
             self.size_class_state.injector.push(mem);
         } else {
             self.worker.push(mem);
@@ -287,20 +368,6 @@ fn with_stealer<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
     WORKER.with(|cell| f(&mut cell.borrow_mut()))
 }
 
-/// Get the system's page size.
-fn page_size() -> usize {
-    static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
-
-    let mut page_size = PAGE_SIZE.load(Ordering::Relaxed);
-    if page_size == 0 {
-        // SAFETY: Calling into sysconf
-        page_size =
-            usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("Must fit");
-        PAGE_SIZE.store(page_size, Ordering::Relaxed);
-    }
-    page_size
-}
-
 static BACKGROUND_WORKER: OnceLock<JoinHandle<()>> = OnceLock::new();
 
 struct BackgroundWorker {
@@ -314,58 +381,47 @@ impl BackgroundWorker {
 
     fn run(&self) {
         let global = GlobalStealer::get_static();
+
         let worker = Worker::new_fifo();
+        let mut diagnostics = 0;
         loop {
             std::thread::sleep(self.config.interval);
             for size_class in &global.size_classes {
-                let _ = size_class
-                    .injector
-                    .steal_batch_with_limit(&worker, self.config.batch);
-                while let Some(mut mem) = worker.pop() {
-                    Self::clear(&mut mem);
-                    size_class.injector.push(mem);
-                }
+                let _ = self.clear(size_class, &worker);
             }
+            if diagnostics >= 10 {
+                global.diagnostics();
+                diagnostics = 0;
+            }
+            diagnostics += 1;
         }
     }
 
-    fn clear(mem: &mut Mem) -> bool {
-        // From the documentation: We need a byte for every page, and the length is rounded up
-        // to the full page.
-        let mut bitmap: Vec<u8> = std::iter::repeat(0u8)
-            .take((mem.len() + page_size() - 1) / page_size())
-            .collect();
-
-        // SAFETY: Calling into `mincore`
-        let ret = unsafe {
-            libc::mincore(
-                mem.as_mut_ptr().cast(),
-                mem.len(),
-                bitmap.as_mut_ptr().cast(),
-            )
-        };
-        if ret != 0 {
-            eprintln!(
-                "mincore failed: {ret} {:?}",
-                std::io::Error::last_os_error()
-            );
-            return false;
-        }
-
-        if bitmap.iter().any(|x| *x != 0) {
-            // SAFETY: Calling into `madvise`
-            let ret =
-                unsafe { libc::madvise(mem.as_mut_ptr().cast(), mem.len(), libc::MADV_REMOVE) };
-            if ret != 0 {
-                eprintln!(
-                    "madvise failed: {ret} {:?}",
-                    std::io::Error::last_os_error()
-                );
+    #[inline]
+    fn clear(&self, size_class: &SizeClassState, worker: &Worker<Mem>) -> usize {
+        let _ = size_class
+            .injector
+            .steal_batch_with_limit(worker, self.config.batch);
+        let mut count = 0;
+        while let Some(mut mem) = worker.pop() {
+            match Self::clear_area(&mut mem) {
+                Ok(()) => count += 1,
+                Err(e) => panic!("Syscall failed: {e:?}"),
             }
-            true
-        } else {
-            false
+            size_class.clean_injector.push(mem);
         }
+        count
+    }
+
+    fn clear_area(mem: &mut Mem) -> std::io::Result<()> {
+        // SAFETY: Calling into `madvise`
+        let ret = unsafe { libc::madvise(mem.as_mut_ptr().cast(), mem.len(), libc::MADV_REMOVE) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("madvise failed: {ret} {err:?}",);
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -383,30 +439,31 @@ pub struct BackgroundWorkerConfig {
 
 /// An abstraction over different kinds of allocated regions.
 pub enum Region<T> {
-    /// An empty region, not backed by anything.
-    Nil,
-    /// A heap-allocated region, represented as a vector.
+    /// A possibly empty heap-allocated region, represented as a vector.
     Heap(Vec<T>),
     /// A mmaped region, represented by a vector and its backing memory mapping.
     MMap(Vec<T>, Option<Mem>),
 }
 
 impl<T> Default for Region<T> {
+    #[inline]
     fn default() -> Self {
-        Self::new_nil()
+        Self::new_empty()
     }
 }
 
 impl<T> Region<T> {
-    const MMAP_SIZE: usize = 2 << 20;
+    const MIN_MMAP_SIZE: usize = 1 << 16;
 
     /// Create a new empty region.
+    #[inline]
     #[must_use]
-    pub fn new_nil() -> Region<T> {
-        Region::Nil
+    pub fn new_empty() -> Region<T> {
+        Region::Heap(Vec::new())
     }
 
     /// Create a new heap-allocated region of a specific capacity.
+    #[inline]
     #[must_use]
     pub fn new_heap(capacity: usize) -> Region<T> {
         Region::Heap(Vec::with_capacity(capacity))
@@ -418,6 +475,7 @@ impl<T> Region<T> {
     /// # Errors
     ///
     /// Returns an error if the memory allocation fails.
+    #[inline]
     pub fn new_mmap(capacity: usize) -> Result<Region<T>, AllocError> {
         // return Ok(Self::new_heap(capacity));
         // Round up to at least a page.
@@ -444,19 +502,18 @@ impl<T> Region<T> {
     /// Mib, and [`Region::MMap`] for larger capacities.
     #[must_use]
     pub fn new_auto(capacity: usize) -> Region<T> {
-        if std::mem::size_of::<T>() == 0 {
+        if std::mem::size_of::<T>() == 0 || capacity == 0 {
             // Handle zero-sized types.
+            return Region::new_heap(capacity);
+        }
+        let bytes = std::mem::size_of::<T>() * capacity;
+        if bytes < Self::MIN_MMAP_SIZE {
             Region::new_heap(capacity)
         } else {
-            let bytes = std::mem::size_of::<T>() * capacity;
-            match bytes {
-                0 => Region::new_nil(),
-                Self::MMAP_SIZE => Region::new_mmap(capacity).unwrap_or_else(|err| {
-                    eprintln!("Mmap pool exhausted, falling back to heap: {err}");
-                    Region::new_heap(capacity)
-                }),
-                _ => Region::new_heap(capacity),
-            }
+            Region::new_mmap(capacity).unwrap_or_else(|err| {
+                eprintln!("Mmap pool exhausted, falling back to heap: {err}");
+                Region::new_heap(capacity)
+            })
         }
     }
 
@@ -465,75 +522,86 @@ impl<T> Region<T> {
     /// # Safety
     ///
     /// Discards all contends. Elements are not dropped.
+    #[inline]
     pub unsafe fn clear(&mut self) {
         match self {
-            Region::Nil => {}
             Region::Heap(vec) | Region::MMap(vec, _) => vec.set_len(0),
         }
     }
 
     /// Returns the capacity of the underlying allocation.
+    #[inline]
     #[must_use]
     pub fn capacity(&self) -> usize {
         match self {
-            Region::Nil => 0,
             Region::Heap(vec) | Region::MMap(vec, _) => vec.capacity(),
         }
     }
 
     /// Returns the number of elements in the allocation.
+    #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
-            Region::Nil => 0,
             Region::Heap(vec) | Region::MMap(vec, _) => vec.len(),
         }
     }
 
     /// Returns true if the region does not contain any elements.
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
-            Region::Nil => true,
             Region::Heap(vec) | Region::MMap(vec, _) => vec.is_empty(),
         }
     }
-}
 
-impl<T, D> AsMut<D> for Region<T>
-where
-    <Region<T> as Deref>::Target: AsMut<D>,
-{
-    fn as_mut(&mut self) -> &mut D {
-        self.deref_mut().as_mut()
-    }
-}
-
-impl<T> Deref for Region<T> {
-    type Target = Vec<T>;
-
-    /// Obtain a vector of the allocation. Panics for [`Region::Nil`].
-    fn deref(&self) -> &Self::Target {
+    /// Dereference to the contained vector
+    #[inline]
+    #[must_use]
+    pub fn as_vec(&self) -> &Vec<T> {
         match self {
-            Region::Nil => panic!("Cannot represent Nil region as vector"),
             Region::Heap(vec) | Region::MMap(vec, _) => vec,
         }
     }
 }
 
-impl<T> DerefMut for Region<T> {
-    /// Obtain a mutable vector of the allocation. Panics for [`Region::Nil`].
-    fn deref_mut(&mut self) -> &mut Self::Target {
+impl<T> AsMut<Vec<T>> for Region<T> {
+    #[inline]
+    fn as_mut(&mut self) -> &mut Vec<T> {
         match self {
-            Region::Nil => panic!("Cannot represent Nil region as vector"),
             Region::Heap(vec) | Region::MMap(vec, _) => vec,
         }
     }
 }
 
 impl<T: Clone> Region<T> {
+    #[inline]
     pub fn extend_from_slice(&mut self, slice: &[T]) {
-        self.deref_mut().extend_from_slice(slice);
+        self.as_mut().extend_from_slice(slice);
+    }
+}
+
+impl<T> Extend<T> for Region<T> {
+    #[inline]
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.as_mut().extend(iter);
+    }
+}
+
+impl<T> std::ops::Deref for Region<T> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_vec()
+    }
+}
+
+impl<T> std::ops::DerefMut for Region<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut()
     }
 }
 
@@ -541,14 +609,13 @@ impl<T> Drop for Region<T> {
     #[inline]
     fn drop(&mut self) {
         match self {
-            Region::Nil => {}
             Region::Heap(vec) => {
-                // SAFETY: Don't drop the elements.
+                // SAFETY: Don't drop the elements, drop the vec.
                 unsafe { vec.set_len(0) }
             }
             Region::MMap(vec, mmap) => {
                 // Forget reasoning: The vector points to the mapped region, which frees the
-                // allocation
+                // allocation. Don't drop elements, don't drop vec.
                 std::mem::forget(std::mem::take(vec));
                 with_stealer(|s| s.push(std::mem::take(mmap).unwrap()));
             }
@@ -559,14 +626,13 @@ impl<T> Drop for Region<T> {
 #[cfg(test)]
 mod test {
     use crate::{AllocError, BackgroundWorkerConfig, Region};
-    use std::ops::DerefMut;
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
 
     #[test]
     fn test_1() -> Result<(), AllocError> {
         let mut r: Region<u8> = Region::new_mmap(4 << 20)?;
-        r.deref_mut().push(1);
+        r.as_mut().push(1);
         drop(r);
         Ok(())
     }
@@ -574,7 +640,7 @@ mod test {
     #[test]
     fn test_2() -> Result<(), AllocError> {
         let mut r: Region<u8> = Region::new_mmap(4 << 20)?;
-        r.deref_mut().push(1);
+        r.as_mut().push(1);
         Ok(())
     }
 
@@ -594,8 +660,8 @@ mod test {
                     i += 1;
                     let mut r: Region<u8> =
                         std::hint::black_box(Region::new_mmap(4 << 20)).unwrap();
-                    // r.deref_mut().extend(std::iter::repeat(0).take(2 << 20));
-                    r.deref_mut().push(1);
+                    // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
+                    r.as_mut().push(1);
                 }
                 println!("repetitions: {i}");
             }
@@ -630,8 +696,8 @@ mod test {
                         .map(|_| {
                             let mut r: Region<u8> =
                                 std::hint::black_box(Region::new_mmap(2 << 20)).unwrap();
-                            // r.deref_mut().extend(std::iter::repeat(0).take(2 << 20));
-                            r.deref_mut().push(1);
+                            // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
+                            r.as_mut().push(1);
                             r
                         })
                         .collect::<Vec<_>>();
