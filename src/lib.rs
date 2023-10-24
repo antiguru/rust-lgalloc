@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::mem::take;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, AsRawFd};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread::{spawn, JoinHandle, ThreadId};
 use std::time::Duration;
@@ -34,9 +33,6 @@ const INITIAL_SIZE: usize = 32 << 20;
 
 /// Largest supported object size class.
 pub const MAX_SIZE_CLASS: usize = 32;
-
-/// Smallest supported object size class. Corresponds to 4KiB.
-pub const MIN_SIZE_CLASS: usize = 12;
 
 /// Allocation errors
 #[derive(Error, Debug)]
@@ -66,6 +62,8 @@ struct SizeClassState {
     areas: RwLock<Vec<MmapMut>>,
     /// Injector to distribute memory globally.
     injector: Injector<Mem>,
+    /// Injector to distribute memory globally, freed memory.
+    clean_injector: Injector<Mem>,
     /// Slow-path lock to refill pool.
     lock: Mutex<()>,
     /// Thread stealers to allow all participating threads to steal memory.
@@ -178,9 +176,19 @@ impl LocalSizeClass {
             .pop()
             .or_else(|| {
                 std::iter::repeat_with(|| {
+                    // The loop tries to obtain memory in the following order:
+                    // 1. Memory from the global state,
+                    // 2. Memory from the global cleaned state,
+                    // 3. Memory from other threads.
+
                     self.size_class_state
                         .injector
                         .steal_batch_with_limit_and_pop(&self.worker, LOCAL_BUFFER / 2)
+                        .or_else(|| {
+                            self.size_class_state
+                                .clean_injector
+                                .steal_batch_with_limit_and_pop(&self.worker, LOCAL_BUFFER / 2)
+                        })
                         .or_else(|| {
                             self.size_class_state
                                 .stealers
@@ -287,20 +295,6 @@ fn with_stealer<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
     WORKER.with(|cell| f(&mut cell.borrow_mut()))
 }
 
-/// Get the system's page size.
-fn page_size() -> usize {
-    static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
-
-    let mut page_size = PAGE_SIZE.load(Ordering::Relaxed);
-    if page_size == 0 {
-        // SAFETY: Calling into sysconf
-        page_size =
-            usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("Must fit");
-        PAGE_SIZE.store(page_size, Ordering::Relaxed);
-    }
-    page_size
-}
-
 static BACKGROUND_WORKER: OnceLock<JoinHandle<()>> = OnceLock::new();
 
 struct BackgroundWorker {
@@ -314,58 +308,38 @@ impl BackgroundWorker {
 
     fn run(&self) {
         let global = GlobalStealer::get_static();
+
         let worker = Worker::new_fifo();
         loop {
             std::thread::sleep(self.config.interval);
             for size_class in &global.size_classes {
-                let _ = size_class
-                    .injector
-                    .steal_batch_with_limit(&worker, self.config.batch);
-                while let Some(mut mem) = worker.pop() {
-                    Self::clear(&mut mem);
-                    size_class.injector.push(mem);
-                }
+                self.clear(size_class, &worker);
             }
         }
     }
 
-    fn clear(mem: &mut Mem) -> bool {
-        // From the documentation: We need a byte for every page, and the length is rounded up
-        // to the full page.
-        let mut bitmap: Vec<u8> = std::iter::repeat(0u8)
-            .take((mem.len() + page_size() - 1) / page_size())
-            .collect();
-
-        // SAFETY: Calling into `mincore`
-        let ret = unsafe {
-            libc::mincore(
-                mem.as_mut_ptr().cast(),
-                mem.len(),
-                bitmap.as_mut_ptr().cast(),
-            )
-        };
-        if ret != 0 {
-            eprintln!(
-                "mincore failed: {ret} {:?}",
-                std::io::Error::last_os_error()
-            );
-            return false;
-        }
-
-        if bitmap.iter().any(|x| *x != 0) {
-            // SAFETY: Calling into `madvise`
-            let ret =
-                unsafe { libc::madvise(mem.as_mut_ptr().cast(), mem.len(), libc::MADV_REMOVE) };
-            if ret != 0 {
-                eprintln!(
-                    "madvise failed: {ret} {:?}",
-                    std::io::Error::last_os_error()
-                );
+    fn clear(&self, size_class: &SizeClassState, worker: &Worker<Mem>) {
+        let _ = size_class
+            .injector
+            .steal_batch_with_limit(worker, self.config.batch);
+        while let Some(mut mem) = worker.pop() {
+            match Self::clear_area(&mut mem) {
+                Ok(()) => {}
+                Err(e) => panic!("Syscall failed: {e:?}"),
             }
-            true
-        } else {
-            false
+            size_class.clean_injector.push(mem);
         }
+    }
+
+    fn clear_area(mem: &mut Mem) -> std::io::Result<()> {
+        // SAFETY: Calling into `madvise`
+        let ret = unsafe { libc::madvise(mem.as_mut_ptr().cast(), mem.len(), libc::MADV_REMOVE) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("madvise failed: {ret} {err:?}",);
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
