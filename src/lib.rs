@@ -16,8 +16,8 @@ use std::mem::take;
 use std::ops::{Deref, Range};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 use std::thread::{spawn, ThreadId};
 use std::time::Duration;
 
@@ -39,7 +39,6 @@ pub const VALID_SIZE_CLASS: Range<usize> = 16..33;
 
 pub type PhantomUnsync = PhantomData<Cell<()>>;
 pub type PhantomUnsend = PhantomData<MutexGuard<'static, ()>>;
-
 
 /// Allocation errors
 #[derive(Error, Debug)]
@@ -121,7 +120,7 @@ struct GlobalStealer {
     /// Path to store files
     path: RwLock<Option<PathBuf>>,
     /// Shared token to access background thread.
-    background_sender: Mutex<Option<std::sync::mpsc::Sender<BackgroundWorkerConfig>>>
+    background_sender: Mutex<Option<std::sync::mpsc::Sender<BackgroundWorkerConfig>>>,
 }
 
 /// Per-size-class state
@@ -219,7 +218,10 @@ impl ThreadLocalStealer {
         let size_classes = VALID_SIZE_CLASS
             .map(|size_class| LocalSizeClass::new(SizeClass::new_unchecked(size_class), thread_id))
             .collect();
-        Self { size_classes, _phantom: (PhantomData, PhantomData) }
+        Self {
+            size_classes,
+            _phantom: (PhantomData, PhantomData),
+        }
     }
 
     #[inline]
@@ -267,7 +269,7 @@ impl LocalSizeClass {
             size_class,
             size_class_state,
             thread_id,
-            _phantom: (PhantomData, PhantomData)
+            _phantom: (PhantomData, PhantomData),
         }
     }
 
@@ -422,8 +424,9 @@ impl BackgroundWorker {
         let mut diagnostics = 0;
         loop {
             match self.receiver.try_recv() {
-                Ok(config) => self.config = config,  Err(TryRecvError::Disconnected) => break,
-                Err(TryRecvError::Empty) => {},
+                Ok(config) => self.config = config,
+                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
             }
             for size_class in &global.size_classes {
                 let _ = self.clear(size_class, &worker);
@@ -487,8 +490,8 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
     if let Some(config) = &config.background_config {
         let (sender, receiver) = std::sync::mpsc::channel();
         *stealer.background_sender.lock().unwrap() = Some(sender);
-            let mut worker = BackgroundWorker::new(config.clone(), receiver);
-            spawn(move || worker.run());
+        let mut worker = BackgroundWorker::new(config.clone(), receiver);
+        spawn(move || worker.run());
     }
 }
 
