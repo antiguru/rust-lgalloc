@@ -13,7 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::take;
-use std::ops::{Deref, Range};
+use std::ops::Range;
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -37,8 +37,8 @@ const INITIAL_SIZE: usize = 32 << 20;
 /// Range of valid size classes.
 pub const VALID_SIZE_CLASS: Range<usize> = 16..33;
 
-pub type PhantomUnsync = PhantomData<Cell<()>>;
-pub type PhantomUnsend = PhantomData<MutexGuard<'static, ()>>;
+type PhantomUnsync = PhantomData<Cell<()>>;
+type PhantomUnsend = PhantomData<MutexGuard<'static, ()>>;
 
 /// Allocation errors
 #[derive(Error, Debug)]
@@ -58,12 +58,10 @@ pub enum AllocError {
 struct SizeClass(usize);
 
 impl SizeClass {
-    #[inline]
     fn new_unchecked(value: usize) -> Self {
         Self(value)
     }
 
-    #[inline]
     fn index(&self) -> usize {
         self.0 - VALID_SIZE_CLASS.start
     }
@@ -72,7 +70,6 @@ impl SizeClass {
         1 << self.0
     }
 
-    #[inline]
     fn from_index(index: usize) -> Self {
         Self(index + VALID_SIZE_CLASS.start)
     }
@@ -90,22 +87,12 @@ impl SizeClass {
 impl TryFrom<usize> for SizeClass {
     type Error = AllocError;
 
-    #[inline]
     fn try_from(value: usize) -> Result<Self, Self::Error> {
         if VALID_SIZE_CLASS.contains(&value) {
             Ok(SizeClass(value))
         } else {
             Err(AllocError::InvalidSizeClass)
         }
-    }
-}
-
-impl Deref for SizeClass {
-    type Target = usize;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 
@@ -224,12 +211,10 @@ impl ThreadLocalStealer {
         }
     }
 
-    #[inline]
     fn get(&mut self, size_class: SizeClass) -> Result<Mem, AllocError> {
         self.size_classes[size_class.index()].get_with_refill()
     }
 
-    #[inline]
     fn push(&self, mem: Mem) {
         let size_class = SizeClass::from_byte_size_unchecked(mem.len());
 
@@ -277,7 +262,7 @@ impl LocalSizeClass {
     /// the global state. As a last option, obtains memory from other workers.
     ///
     /// Returns [`AllcError::OutOfMemory`] if all pools are empty.
-    #[inline]
+    #[inline(always)]
     fn get(&self) -> Result<Mem, AllocError> {
         self.worker
             .pop()
@@ -313,7 +298,6 @@ impl LocalSizeClass {
     }
 
     /// Like [`Self::get()`] but trying to refill the pool if it is empty.
-    #[inline]
     fn get_with_refill(&self) -> Result<Mem, AllocError> {
         // Fast-path: Get non-blocking
         match self.get() {
@@ -332,7 +316,6 @@ impl LocalSizeClass {
     }
 
     /// Recycle memory. Stores it locally or forwards it to the global state.
-    #[inline]
     fn push(&self, mem: Mem) {
         debug_assert_eq!(mem.len(), self.size_class.byte_size());
         if self.worker.len() >= LOCAL_BUFFER {
@@ -402,7 +385,6 @@ impl Drop for LocalSizeClass {
     }
 }
 
-#[inline]
 fn with_stealer<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
     WORKER.with(|cell| f(&mut cell.borrow_mut()))
 }
@@ -442,7 +424,6 @@ impl BackgroundWorker {
         }
     }
 
-    #[inline]
     fn clear(&self, size_class: &SizeClassState, worker: &Worker<Mem>) -> usize {
         let _ = size_class
             .injector
@@ -572,12 +553,12 @@ impl<T> Region<T> {
     /// # Errors
     ///
     /// Returns an error if the memory allocation fails.
-    #[inline]
+    #[inline(always)]
     pub fn new_mmap(capacity: usize) -> Result<Region<T>, AllocError> {
         // return Ok(Self::new_heap(capacity));
         // Round up to at least a page.
         let byte_len = std::cmp::max(0x1000, std::mem::size_of::<T>() * capacity);
-        let size_class = SizeClass::from_byte_size(byte_len).expect("Supported size class");
+        let size_class = SizeClass::from_byte_size(byte_len)?;
         with_stealer(|s| s.get(size_class)).map(|mem| {
             debug_assert_eq!(mem.len(), size_class.byte_size());
             let actual_capacity = mem.len() / std::mem::size_of::<T>();
