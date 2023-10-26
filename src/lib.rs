@@ -9,13 +9,16 @@
 //! This library is very unsafe on account of `unsafe` and interacting directly
 //! with libc, including Linux extension.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::mem::take;
 use std::ops::{Deref, Range};
 use std::os::fd::{AsFd, AsRawFd};
-use std::sync::{Mutex, OnceLock, RwLock};
-use std::thread::{spawn, JoinHandle, ThreadId};
+use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::thread::{spawn, ThreadId};
 use std::time::Duration;
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
@@ -34,6 +37,10 @@ const INITIAL_SIZE: usize = 32 << 20;
 /// Range of valid size classes.
 pub const VALID_SIZE_CLASS: Range<usize> = 16..33;
 
+pub type PhantomUnsync = PhantomData<Cell<()>>;
+pub type PhantomUnsend = PhantomData<MutexGuard<'static, ()>>;
+
+
 /// Allocation errors
 #[derive(Error, Debug)]
 pub enum AllocError {
@@ -48,6 +55,7 @@ pub enum AllocError {
     InvalidSizeClass,
 }
 
+#[derive(Clone, Copy)]
 struct SizeClass(usize);
 
 impl SizeClass {
@@ -61,9 +69,22 @@ impl SizeClass {
         self.0 - VALID_SIZE_CLASS.start
     }
 
+    fn byte_size(&self) -> usize {
+        1 << self.0
+    }
+
     #[inline]
     fn from_index(index: usize) -> Self {
         Self(index + VALID_SIZE_CLASS.start)
+    }
+
+    fn from_byte_size(byte_size: usize) -> Result<Self, AllocError> {
+        let class = byte_size.next_power_of_two().trailing_zeros() as usize;
+        class.try_into()
+    }
+
+    fn from_byte_size_unchecked(byte_size: usize) -> Self {
+        Self::new_unchecked(byte_size.next_power_of_two().trailing_zeros() as usize)
     }
 }
 
@@ -97,6 +118,10 @@ struct GlobalStealer {
     /// State for each size class. An entry at position `x` handle size class `x`, which is areas
     /// of size `1<<x`.
     size_classes: Vec<SizeClassState>,
+    /// Path to store files
+    path: RwLock<Option<PathBuf>>,
+    /// Shared token to access background thread.
+    background_sender: Mutex<Option<std::sync::mpsc::Sender<BackgroundWorkerConfig>>>
 }
 
 /// Per-size-class state
@@ -121,8 +146,7 @@ impl GlobalStealer {
     }
 
     /// Obtain the per-size-class global state.
-    fn get_size_class(&self, size_class: usize) -> &SizeClassState {
-        let size_class = SizeClass::new_unchecked(size_class);
+    fn get_size_class(&self, size_class: SizeClass) -> &SizeClassState {
         &self.size_classes[size_class.index()]
     }
 
@@ -133,7 +157,11 @@ impl GlobalStealer {
             size_classes.push(SizeClassState::default());
         }
 
-        Self { size_classes }
+        Self {
+            size_classes,
+            path: Default::default(),
+            background_sender: Default::default(),
+        }
     }
 
     /// Print diagnostics about the state of the allocator.
@@ -149,19 +177,23 @@ impl GlobalStealer {
                 let mut free_areas = injector_len + clean_len;
                 eprintln!(
                     "Size class {index} ({}) areas: {} global: {injector_len} chunks -clean: {clean_len} chunks",
-                    1 << *size_class,
+                    size_class.byte_size(),
                     areas.len()
                 );
                 let stealers = size_class_state.stealers.read().unwrap();
                 for (thread, stealer) in &*stealers {
                     let stealer_len = stealer.len();
+                    if stealer_len == 0 {
+                        continue;
+                    }
                     free_areas += stealer_len;
                     eprintln!("  {thread:?} {stealer_len}");
                 }
                 eprintln!(
-                    "  free info: {}/{total} bytes, {free_areas}/{} chunks",
-                    free_areas * (1 << *size_class),
-                    total / (1 << *size_class)
+                    "  free info: {}/{} bytes, {free_areas}/{} chunks",
+                    free_areas * size_class.byte_size() / 1024,
+                    total / 1024,
+                    total / size_class.byte_size(),
                 );
             }
         }
@@ -178,28 +210,26 @@ impl Drop for GlobalStealer {
 struct ThreadLocalStealer {
     /// Per-size-class state
     size_classes: Vec<LocalSizeClass>,
+    _phantom: (PhantomUnsend, PhantomUnsync),
 }
 
 impl ThreadLocalStealer {
     fn new() -> Self {
         let thread_id = std::thread::current().id();
         let size_classes = VALID_SIZE_CLASS
-            .map(|size_class| LocalSizeClass::new(size_class, thread_id))
+            .map(|size_class| LocalSizeClass::new(SizeClass::new_unchecked(size_class), thread_id))
             .collect();
-        Self { size_classes }
+        Self { size_classes, _phantom: (PhantomData, PhantomData) }
     }
 
     #[inline]
-    fn get(&mut self, size_class: usize) -> Result<Mem, AllocError> {
-        let size_class: SizeClass = size_class.try_into()?;
-
+    fn get(&mut self, size_class: SizeClass) -> Result<Mem, AllocError> {
         self.size_classes[size_class.index()].get_with_refill()
     }
 
     #[inline]
     fn push(&self, mem: Mem) {
-        let size_class =
-            SizeClass::new_unchecked(mem.len().next_power_of_two().trailing_zeros() as usize);
+        let size_class = SizeClass::from_byte_size_unchecked(mem.len());
 
         self.size_classes[size_class.index()].push(mem);
     }
@@ -214,16 +244,17 @@ struct LocalSizeClass {
     /// Local memory queue.
     worker: Worker<Mem>,
     /// Size class we're covering
-    size_class: usize,
+    size_class: SizeClass,
     /// Handle to global size class state
     size_class_state: &'static SizeClassState,
     /// Owning thread's ID
     thread_id: ThreadId,
+    _phantom: (PhantomUnsend, PhantomUnsync),
 }
 
 impl LocalSizeClass {
     /// Construct a new local size class state. Registers the worker with the global state.
-    fn new(size_class: usize, thread_id: ThreadId) -> Self {
+    fn new(size_class: SizeClass, thread_id: ThreadId) -> Self {
         let worker = Worker::new_lifo();
         let stealer = GlobalStealer::get_static();
         let size_class_state = stealer.get_size_class(size_class);
@@ -236,6 +267,7 @@ impl LocalSizeClass {
             size_class,
             size_class_state,
             thread_id,
+            _phantom: (PhantomData, PhantomData)
         }
     }
 
@@ -300,7 +332,7 @@ impl LocalSizeClass {
     /// Recycle memory. Stores it locally or forwards it to the global state.
     #[inline]
     fn push(&self, mem: Mem) {
-        debug_assert_eq!(mem.len(), 1 << self.size_class);
+        debug_assert_eq!(mem.len(), self.size_class.byte_size());
         if self.worker.len() >= LOCAL_BUFFER {
             self.size_class_state.injector.push(mem);
         } else {
@@ -315,14 +347,14 @@ impl LocalSizeClass {
         let mut stash = self.size_class_state.areas.write().unwrap();
 
         let byte_len = stash.iter().last().map_or_else(
-            || std::cmp::max(INITIAL_SIZE, 1 << self.size_class),
+            || std::cmp::max(INITIAL_SIZE, self.size_class.byte_size()),
             |mmap| mmap.len() * 2,
         );
 
         let mut mmap = Self::init_file(byte_len)?;
         // SAFETY: Changing the lifetime of the mapping to static.
         let area: Mem = unsafe { std::mem::transmute(&mut *mmap) };
-        let mut chunks = area.chunks_mut(1 << self.size_class);
+        let mut chunks = area.chunks_mut(self.size_class.byte_size());
         let mem = chunks.next().expect("At least once chunk allocated.");
         for slice in chunks {
             self.size_class_state.injector.push(slice);
@@ -334,8 +366,13 @@ impl LocalSizeClass {
     /// Allocate and map a file of size `byte_len`. Returns an handle, or error if the allocation
     /// fails.
     fn init_file(byte_len: usize) -> Result<MmapMut, AllocError> {
-        // TODO: Make the directory configurable.
-        let file = tempfile::tempfile()?;
+        let path = GlobalStealer::get_static().path.read().unwrap().clone();
+        let Some(path) = path else {
+            return Err(AllocError::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            )));
+        };
+        let file = tempfile::tempfile_in(path)?;
         // SAFETY: Calling ftruncate on the file.
         unsafe {
             match libc::ftruncate(
@@ -368,32 +405,37 @@ fn with_stealer<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
     WORKER.with(|cell| f(&mut cell.borrow_mut()))
 }
 
-static BACKGROUND_WORKER: OnceLock<JoinHandle<()>> = OnceLock::new();
-
 struct BackgroundWorker {
     config: BackgroundWorkerConfig,
+    receiver: Receiver<BackgroundWorkerConfig>,
 }
 
 impl BackgroundWorker {
-    fn new(config: BackgroundWorkerConfig) -> Self {
-        Self { config }
+    fn new(config: BackgroundWorkerConfig, receiver: Receiver<BackgroundWorkerConfig>) -> Self {
+        Self { config, receiver }
     }
 
-    fn run(&self) {
+    fn run(&mut self) {
         let global = GlobalStealer::get_static();
 
         let worker = Worker::new_fifo();
         let mut diagnostics = 0;
         loop {
-            std::thread::sleep(self.config.interval);
+            match self.receiver.try_recv() {
+                Ok(config) => self.config = config,  Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {},
+            }
             for size_class in &global.size_classes {
                 let _ = self.clear(size_class, &worker);
             }
             if diagnostics >= 10 {
-                global.diagnostics();
+                if self.config.print_stats {
+                    global.diagnostics();
+                }
                 diagnostics = 0;
             }
             diagnostics += 1;
+            std::thread::sleep(self.config.interval);
         }
     }
 
@@ -425,16 +467,68 @@ impl BackgroundWorker {
     }
 }
 
-pub fn background_worker(config: BackgroundWorkerConfig) -> &'static JoinHandle<()> {
-    BACKGROUND_WORKER.get_or_init(|| {
-        let worker = BackgroundWorker::new(config);
-        spawn(move || worker.run())
-    })
+/// Set or update the configuration for lgalloc.
+///
+/// The function accepts a configuration, which is then applied on lgalloc. It allows clients to
+/// change the path where area files reside, and change the configuration of the background task.
+///
+/// Updating the area path only applies to new allocations, existing allocations are not moved to
+/// the new path.
+///
+/// Updating the background thread configuration eventually applies the new configuration on the
+/// running thread, or starts the background worker.
+pub fn lgalloc_set_config(config: &LgAlloc) {
+    let stealer = GlobalStealer::get_static();
+
+    if let Some(path) = &config.path {
+        *stealer.path.write().unwrap() = Some(path.clone());
+    }
+
+    if let Some(config) = &config.background_config {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *stealer.background_sender.lock().unwrap() = Some(sender);
+            let mut worker = BackgroundWorker::new(config.clone(), receiver);
+            spawn(move || worker.run());
+    }
 }
 
+/// Configuration for lgalloc's background worker.
+#[derive(Default, Clone, Eq, PartialEq)]
 pub struct BackgroundWorkerConfig {
+    /// How frequently it should tick
     pub interval: Duration,
+    /// How many allocations to clear per size class.
     pub batch: usize,
+    /// Enable debug stat printing.
+    pub print_stats: bool,
+}
+
+/// Lgalloc configuration
+#[derive(Default, Clone, Eq, PartialEq)]
+pub struct LgAlloc {
+    /// Path where files reside.
+    pub path: Option<PathBuf>,
+    /// Configuration of the background worker.
+    pub background_config: Option<BackgroundWorkerConfig>,
+}
+
+impl LgAlloc {
+    /// Construct a new configuration. All values are initialized to their default (None) values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the background worker configuration.
+    pub fn with_background_config(&mut self, config: BackgroundWorkerConfig) -> &mut Self {
+        self.background_config = Some(config);
+        self
+    }
+
+    /// Set the area file path.
+    pub fn with_path(&mut self, path: PathBuf) -> &mut Self {
+        self.path = Some(path);
+        self
+    }
 }
 
 /// An abstraction over different kinds of allocated regions.
@@ -480,11 +574,10 @@ impl<T> Region<T> {
         // return Ok(Self::new_heap(capacity));
         // Round up to at least a page.
         let byte_len = std::cmp::max(0x1000, std::mem::size_of::<T>() * capacity);
-        let byte_len = byte_len.next_power_of_two();
-        let size_class = byte_len.trailing_zeros() as usize;
-        let actual_capacity = byte_len / std::mem::size_of::<T>();
+        let size_class = SizeClass::from_byte_size(byte_len).expect("Supported size class");
         with_stealer(|s| s.get(size_class)).map(|mem| {
-            debug_assert_eq!(mem.len(), byte_len);
+            debug_assert_eq!(mem.len(), size_class.byte_size());
+            let actual_capacity = mem.len() / std::mem::size_of::<T>();
             let ptr = mem.as_mut_ptr().cast();
             // SAFETY: memory points to suitable memory.
             let new_local = unsafe { Vec::from_raw_parts(ptr, 0, actual_capacity) };
@@ -625,12 +718,29 @@ impl<T> Drop for Region<T> {
 
 #[cfg(test)]
 mod test {
-    use crate::{AllocError, BackgroundWorkerConfig, Region};
-    use std::sync::{Arc, RwLock};
+    use crate::{AllocError, BackgroundWorkerConfig, LgAlloc, Region};
+    use std::sync::{Arc, OnceLock, RwLock};
     use std::time::Duration;
+
+    static INIT: OnceLock<()> = OnceLock::new();
+
+    fn initialize() {
+        INIT.get_or_init(|| {
+            crate::lgalloc_set_config(
+                LgAlloc::new()
+                    .with_background_config(BackgroundWorkerConfig {
+                        interval: Duration::from_secs(1),
+                        batch: 32,
+                        print_stats: false,
+                    })
+                    .with_path(std::env::temp_dir()),
+            );
+        });
+    }
 
     #[test]
     fn test_1() -> Result<(), AllocError> {
+        initialize();
         let mut r: Region<u8> = Region::new_mmap(4 << 20)?;
         r.as_mut().push(1);
         drop(r);
@@ -639,6 +749,7 @@ mod test {
 
     #[test]
     fn test_2() -> Result<(), AllocError> {
+        initialize();
         let mut r: Region<u8> = Region::new_mmap(4 << 20)?;
         r.as_mut().push(1);
         Ok(())
@@ -646,10 +757,7 @@ mod test {
 
     #[test]
     fn test_3() -> Result<(), AllocError> {
-        crate::background_worker(BackgroundWorkerConfig {
-            interval: Duration::from_secs(1),
-            batch: 32,
-        });
+        initialize();
         let until = Arc::new(RwLock::new(true));
 
         let inner = || {
@@ -683,6 +791,7 @@ mod test {
 
     #[test]
     fn test_4() -> Result<(), AllocError> {
+        initialize();
         let until = Arc::new(RwLock::new(true));
 
         let inner = || {
@@ -692,7 +801,6 @@ mod test {
                 while *until.read().unwrap() {
                     i += 64;
                     let _ = (0..64)
-                        .into_iter()
                         .map(|_| {
                             let mut r: Region<u8> =
                                 std::hint::black_box(Region::new_mmap(2 << 20)).unwrap();
