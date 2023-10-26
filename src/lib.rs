@@ -16,6 +16,7 @@ use std::mem::take;
 use std::ops::Range;
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 use std::thread::{spawn, ThreadId};
@@ -52,6 +53,15 @@ pub enum AllocError {
     /// Size class too large or small
     #[error("Invalid size class")]
     InvalidSizeClass,
+    /// Allocator disabled
+    #[error("Disabled by configuration")]
+    Disabled,
+}
+
+impl AllocError {
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, AllocError::Disabled)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -98,6 +108,9 @@ impl TryFrom<usize> for SizeClass {
 
 /// Handle to the shared global state.
 static INJECTOR: OnceLock<GlobalStealer> = OnceLock::new();
+
+/// Enabled switch to turn on or off lgalloc. Off by default.
+static LGALLOC_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Type maintaining the global state for each size class.
 struct GlobalStealer {
@@ -212,6 +225,9 @@ impl ThreadLocalStealer {
     }
 
     fn get(&mut self, size_class: SizeClass) -> Result<Mem, AllocError> {
+        if !LGALLOC_ENABLED.load(Ordering::Relaxed) {
+            return Err(AllocError::Disabled);
+        }
         self.size_classes[size_class.index()].get_with_refill()
     }
 
@@ -464,6 +480,10 @@ impl BackgroundWorker {
 pub fn lgalloc_set_config(config: &LgAlloc) {
     let stealer = GlobalStealer::get_static();
 
+    if let Some(enabled) = &config.enabled {
+        LGALLOC_ENABLED.store(*enabled, Ordering::Relaxed);
+    }
+
     if let Some(path) = &config.path {
         *stealer.path.write().unwrap() = Some(path.clone());
     }
@@ -490,6 +510,8 @@ pub struct BackgroundWorkerConfig {
 /// Lgalloc configuration
 #[derive(Default, Clone, Eq, PartialEq)]
 pub struct LgAlloc {
+    /// Whether the allocator is enabled or not.
+    pub enabled: Option<bool>,
     /// Path where files reside.
     pub path: Option<PathBuf>,
     /// Configuration of the background worker.
@@ -500,6 +522,11 @@ impl LgAlloc {
     /// Construct a new configuration. All values are initialized to their default (None) values.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn enable(&mut self) -> &mut Self {
+        self.enabled = Some(true);
+        self
     }
 
     /// Set the background worker configuration.
@@ -588,7 +615,9 @@ impl<T> Region<T> {
             Region::new_heap(capacity)
         } else {
             Region::new_mmap(capacity).unwrap_or_else(|err| {
-                eprintln!("Mmap pool exhausted, falling back to heap: {err}");
+                if !err.is_disabled() {
+                    eprintln!("Mmap pool exhausted, falling back to heap: {err}");
+                }
                 Region::new_heap(capacity)
             })
         }
@@ -712,6 +741,7 @@ mod test {
         INIT.get_or_init(|| {
             crate::lgalloc_set_config(
                 LgAlloc::new()
+                    .enable()
                     .with_background_config(BackgroundWorkerConfig {
                         interval: Duration::from_secs(1),
                         batch: 32,
