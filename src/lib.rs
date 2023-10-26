@@ -16,9 +16,9 @@ use std::mem::take;
 use std::ops::Range;
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::thread::{spawn, ThreadId};
 use std::time::Duration;
 
@@ -106,6 +106,14 @@ impl TryFrom<usize> for SizeClass {
     }
 }
 
+#[derive(Default, Debug)]
+struct AllocStats {
+    allocations: AtomicU64,
+    slow_path: AtomicU64,
+    refill: AtomicU64,
+    deallocations: AtomicU64,
+}
+
 /// Handle to the shared global state.
 static INJECTOR: OnceLock<GlobalStealer> = OnceLock::new();
 
@@ -135,7 +143,9 @@ struct SizeClassState {
     /// Slow-path lock to refill pool.
     lock: Mutex<()>,
     /// Thread stealers to allow all participating threads to steal memory.
-    stealers: RwLock<HashMap<ThreadId, Stealer<Mem>>>,
+    stealers: RwLock<HashMap<ThreadId, PerThreadState<Mem>>>,
+    /// Summed stats for terminated threads.
+    alloc_stats: AllocStats,
 }
 
 impl GlobalStealer {
@@ -180,8 +190,8 @@ impl GlobalStealer {
                     areas.len()
                 );
                 let stealers = size_class_state.stealers.read().unwrap();
-                for (thread, stealer) in &*stealers {
-                    let stealer_len = stealer.len();
+                for (thread, state) in &*stealers {
+                    let stealer_len = state.stealer.len();
                     if stealer_len == 0 {
                         continue;
                     }
@@ -203,6 +213,11 @@ impl Drop for GlobalStealer {
     fn drop(&mut self) {
         take(&mut self.size_classes);
     }
+}
+
+struct PerThreadState<T> {
+    stealer: Stealer<T>,
+    alloc_stats: Arc<AllocStats>,
 }
 
 /// Per-thread and state, sharded by size class.
@@ -253,6 +268,7 @@ struct LocalSizeClass {
     /// Owning thread's ID
     thread_id: ThreadId,
     _phantom: (PhantomUnsend, PhantomUnsync),
+    stats: Arc<AllocStats>,
 }
 
 impl LocalSizeClass {
@@ -262,14 +278,23 @@ impl LocalSizeClass {
         let stealer = GlobalStealer::get_static();
         let size_class_state = stealer.get_size_class(size_class);
 
+        let stats = Arc::new(AllocStats::default());
+
         let mut lock = size_class_state.stealers.write().unwrap();
-        lock.insert(thread_id, worker.stealer());
+        lock.insert(
+            thread_id,
+            PerThreadState {
+                stealer: worker.stealer(),
+                alloc_stats: Arc::clone(&stats),
+            },
+        );
 
         Self {
             worker,
             size_class,
             size_class_state,
             thread_id,
+            stats,
             _phantom: (PhantomData, PhantomData),
         }
     }
@@ -303,7 +328,7 @@ impl LocalSizeClass {
                                 .read()
                                 .unwrap()
                                 .values()
-                                .map(Stealer::steal)
+                                .map(|state| state.stealer.steal())
                                 .collect()
                         })
                 })
@@ -315,10 +340,12 @@ impl LocalSizeClass {
 
     /// Like [`Self::get()`] but trying to refill the pool if it is empty.
     fn get_with_refill(&self) -> Result<Mem, AllocError> {
+        self.stats.allocations.fetch_add(1, Ordering::Relaxed);
         // Fast-path: Get non-blocking
         match self.get() {
             Ok(mem) => Ok(mem),
             Err(AllocError::OutOfMemory) => {
+                self.stats.slow_path.fetch_add(1, Ordering::Relaxed);
                 // Get a a slow-path lock
                 let _lock = self.size_class_state.lock.lock().unwrap();
                 // Try again because another thread might have refilled already
@@ -334,6 +361,7 @@ impl LocalSizeClass {
     /// Recycle memory. Stores it locally or forwards it to the global state.
     fn push(&self, mem: Mem) {
         debug_assert_eq!(mem.len(), self.size_class.byte_size());
+        self.stats.deallocations.fetch_add(1, Ordering::Relaxed);
         if self.worker.len() >= LOCAL_BUFFER {
             self.size_class_state.injector.push(mem);
         } else {
@@ -345,6 +373,7 @@ impl LocalSizeClass {
     ///
     /// Returns an error if the memory pool cannot be refilled.
     fn try_refill_and_get(&self) -> Result<Mem, AllocError> {
+        self.stats.refill.fetch_add(1, Ordering::Relaxed);
         let mut stash = self.size_class_state.areas.write().unwrap();
 
         let byte_len = stash.iter().last().map_or_else(
@@ -398,6 +427,23 @@ impl Drop for LocalSizeClass {
         while let Some(mem) = self.worker.pop() {
             self.size_class_state.injector.push(mem);
         }
+
+        self.size_class_state.alloc_stats.allocations.fetch_add(
+            self.stats.allocations.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.size_class_state
+            .alloc_stats
+            .refill
+            .fetch_add(self.stats.refill.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.size_class_state.alloc_stats.slow_path.fetch_add(
+            self.stats.slow_path.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.size_class_state.alloc_stats.deallocations.fetch_add(
+            self.stats.deallocations.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -540,6 +586,98 @@ impl LgAlloc {
         self.path = Some(path);
         self
     }
+}
+
+/// Determine global statistics per size class
+///
+/// Note that this function take a read lock on various structures.
+pub fn lgalloc_stats(stats: &mut LgAllocStats) {
+    stats.size_class.clear();
+
+    let global = GlobalStealer::get_static();
+
+    for (index, size_class_state) in global.size_classes.iter().enumerate() {
+        let size_class = SizeClass::from_index(index);
+
+        let areas_lock = size_class_state.areas.read().unwrap();
+
+        let areas = areas_lock.len();
+        if areas == 0 {
+            continue;
+        }
+
+        let size_class = size_class.byte_size();
+        let area_total_bytes = areas_lock.iter().map(|area| area.len()).sum();
+        let global_regions = size_class_state.injector.len();
+        let clean_regions = size_class_state.clean_injector.len();
+        let stealers = size_class_state.stealers.read().unwrap();
+        let mut thread_regions = 0;
+        let mut allocations = 0;
+        let mut deallocations = 0;
+        let mut refill = 0;
+        let mut slow_path = 0;
+        for thread_state in stealers.values() {
+            thread_regions += thread_state.stealer.len();
+            let thread_stats = &*thread_state.alloc_stats;
+            allocations += thread_stats.allocations.load(Ordering::Relaxed);
+            deallocations += thread_stats.deallocations.load(Ordering::Relaxed);
+            refill += thread_stats.refill.load(Ordering::Relaxed);
+            slow_path += thread_stats.slow_path.load(Ordering::Relaxed);
+        }
+
+        let free_regions = thread_regions + global_regions + clean_regions;
+
+        let global_stats = &size_class_state.alloc_stats;
+        allocations += global_stats.allocations.load(Ordering::Relaxed);
+        deallocations += global_stats.deallocations.load(Ordering::Relaxed);
+        refill += global_stats.refill.load(Ordering::Relaxed);
+        slow_path += global_stats.slow_path.load(Ordering::Relaxed);
+
+        stats.size_class.push(SizeClassStats {
+            size_class,
+            areas,
+            area_total_bytes,
+            free_regions,
+            global_regions,
+            clean_regions,
+            thread_regions,
+            allocations,
+            deallocations,
+            refill,
+            slow_path,
+        });
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LgAllocStats {
+    size_class: Vec<SizeClassStats>,
+}
+
+#[derive(Debug)]
+pub struct SizeClassStats {
+    /// Size class in bytes
+    pub size_class: usize,
+    /// Number of areas backing a size class.
+    pub areas: usize,
+    /// Total number of bytes summed across all areas.
+    pub area_total_bytes: usize,
+    /// Free regions
+    pub free_regions: usize,
+    /// Clean free regions in the global allocator
+    pub clean_regions: usize,
+    /// Regions in the global allocator
+    pub global_regions: usize,
+    /// Regions retained in thread-local allocators
+    pub thread_regions: usize,
+    /// Total allocations
+    pub allocations: u64,
+    /// Total slow-path allocations (globally out of memory)
+    pub slow_path: u64,
+    /// Total refills
+    pub refill: u64,
+    /// Total deallocations
+    pub deallocations: u64,
 }
 
 /// An abstraction over different kinds of allocated regions.
@@ -731,7 +869,7 @@ impl<T> Drop for Region<T> {
 
 #[cfg(test)]
 mod test {
-    use crate::{AllocError, BackgroundWorkerConfig, LgAlloc, Region};
+    use crate::{lgalloc_stats, AllocError, BackgroundWorkerConfig, LgAlloc, Region};
     use std::sync::{Arc, OnceLock, RwLock};
     use std::time::Duration;
 
@@ -838,7 +976,10 @@ mod test {
         for handle in handles {
             handle.join().unwrap();
         }
-        // std::thread::sleep(Duration::from_secs(600));
+        std::thread::sleep(Duration::from_secs(1));
+        let mut stats = Default::default();
+        lgalloc_stats(&mut stats);
+        println!("stats: {stats:?}");
         Ok(())
     }
 }
