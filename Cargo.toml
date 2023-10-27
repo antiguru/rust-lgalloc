@@ -7,7 +7,7 @@ description = "Large object allocator"
 publish = false
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/antiguru/rust-lgalloc"
-rust-version = "1.72"
+rust-version = "1.70"
 
 [dependencies]
 crossbeam-deque = "0.8"
