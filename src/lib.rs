@@ -651,7 +651,7 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
 
 #[derive(Debug, Default)]
 pub struct LgAllocStats {
-    size_class: Vec<SizeClassStats>,
+    pub size_class: Vec<SizeClassStats>,
 }
 
 #[derive(Debug)]
