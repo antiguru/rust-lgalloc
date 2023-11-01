@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Moritz Hoffmann <antiguru@gmail.com>"]
 description = "Large object allocator"
-publish = false
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/antiguru/rust-lgalloc"
 rust-version = "1.70"
