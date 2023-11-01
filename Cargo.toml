@@ -1,5 +1,5 @@
 [package]
-name = "rust-lgalloc"
+name = "lgalloc"
 version = "0.1.0"
 edition = "2021"
 authors = ["Moritz Hoffmann <antiguru@gmail.com>"]
