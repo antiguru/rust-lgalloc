@@ -11,7 +11,7 @@ rust-version = "1.70"
 
 [dependencies]
 crossbeam-deque = "0.8"
-libc = "0.2.149"
+libc = "0.2"
 memmap2 = "0.9"
 tempfile = "3.8"
 thiserror = "1.0"
