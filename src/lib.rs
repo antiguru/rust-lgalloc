@@ -38,6 +38,12 @@ const INITIAL_SIZE: usize = 32 << 20;
 /// Range of valid size classes.
 pub const VALID_SIZE_CLASS: Range<usize> = 16..33;
 
+#[cfg(target_os = "linux")]
+pub const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_REMOVE;
+
+#[cfg(not(target_os = "linux"))]
+pub const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
+
 type PhantomUnsync = PhantomData<Cell<()>>;
 type PhantomUnsend = PhantomData<MutexGuard<'static, ()>>;
 
