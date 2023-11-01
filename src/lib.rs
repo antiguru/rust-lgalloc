@@ -509,7 +509,8 @@ impl BackgroundWorker {
 
     fn clear_area(mem: &mut Mem) -> std::io::Result<()> {
         // SAFETY: Calling into `madvise`
-        let ret = unsafe { libc::madvise(mem.as_mut_ptr().cast(), mem.len(), libc::MADV_REMOVE) };
+        let ret =
+            unsafe { libc::madvise(mem.as_mut_ptr().cast(), mem.len(), MADV_DONTNEED_STRATEGY) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             eprintln!("madvise failed: {ret} {err:?}",);
