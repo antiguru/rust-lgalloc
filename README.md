@@ -5,7 +5,7 @@ This library provides a memory allocator for large objects.
 
 ```toml
 [dependencies]
-lgalloc = { git = "https://github.com/antiguru/rust-lgalloc" }
+lgalloc = "0.1"
 ```
 
 ## Example
@@ -38,6 +38,33 @@ fn main() {
 - Generally, use at your own risk because nobody should write a memory allocator.
 - Performance seems to be reasonable, similar to the system allocator when not touching the data,
   and faster when touching the data. The reason is that this library does not unmap its regions.
+
+
+The allocator tries to minimize contention. It relies on thread-local allocations and a
+work-stealing pattern to move allocations between threads. Each size class acts as its own
+allocator.
+
+We use the term region for a power-of-two sized allocation, and area for a contiguous allocations.
+
+* Each thread maintains a bounded cache of regions.
+* If on allocation the cache is empty, it checks the global pool first, and then other threads.
+* The global pool has a dirty and clean variant. Dirty contains allocations that were recently
+  recycled, and clean contains allocations that we marked as not needed/removed to the OS.
+* An optional background worker periodically moves allocations from dirty to clean.
+* Lgalloc makes heavy use of `crossbeam-deque`, which provides a lock-free work stealing API.
+* Refilling areas is a synchronous operation. It requires to create a file, allocate space, and
+  map its contents. We double the size of the allocation each time a size class is empty.
+* Lgalloc reports metrics about allocations, deallocations, and refills.
+
+## To do
+
+* Testing is very limited.
+* Allocating areas of doubling sizes seems to stress the `mmap` system call. Consider a different
+  strategy, such as constant-sized blocks or a limit on what areas we allocate. There's probably
+  a trade-off between area size and number of areas.
+* Fixed-size areas could allow us to move areas between size classes.
+* Reference-counting can determine when an area isn't referenced anymore, although this is not
+  trivial because it's a lock-free system.
 
 #### License
 
