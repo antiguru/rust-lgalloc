@@ -13,14 +13,14 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::take;
-use std::ops::Range;
+use std::ops::{Add, Range};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
-use std::thread::{spawn, ThreadId};
-use std::time::Duration;
+use std::thread::{spawn, JoinHandle, ThreadId};
+use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use memmap2::MmapMut;
@@ -140,7 +140,7 @@ struct GlobalStealer {
     /// Path to store files
     path: RwLock<Option<PathBuf>>,
     /// Shared token to access background thread.
-    background_sender: Mutex<Option<std::sync::mpsc::Sender<BackgroundWorkerConfig>>>,
+    background_sender: Mutex<Option<(JoinHandle<()>, Sender<BackgroundWorkerConfig>)>>,
 }
 
 /// Per-size-class state
@@ -431,27 +431,44 @@ fn with_stealer<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
 struct BackgroundWorker {
     config: BackgroundWorkerConfig,
     receiver: Receiver<BackgroundWorkerConfig>,
+    global_stealer: &'static GlobalStealer,
+    worker: Worker<Mem>,
 }
 
 impl BackgroundWorker {
-    fn new(config: BackgroundWorkerConfig, receiver: Receiver<BackgroundWorkerConfig>) -> Self {
-        Self { config, receiver }
+    fn new(receiver: Receiver<BackgroundWorkerConfig>) -> Self {
+        let mut config = BackgroundWorkerConfig::default();
+        config.interval = Duration::MAX;
+        let global_stealer = GlobalStealer::get_static();
+        let worker = Worker::new_fifo();
+        Self {
+            config,
+            receiver,
+            global_stealer,
+            worker,
+        }
     }
 
     fn run(&mut self) {
-        let global = GlobalStealer::get_static();
-
-        let worker = Worker::new_fifo();
+        let mut next_cleanup = Instant::now();
         loop {
-            match self.receiver.try_recv() {
+            match self
+                .receiver
+                .recv_timeout(next_cleanup.saturating_duration_since(Instant::now()))
+            {
                 Ok(config) => self.config = config,
-                Err(TryRecvError::Disconnected) => break,
-                Err(TryRecvError::Empty) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    next_cleanup = next_cleanup.add(self.config.interval);
+                    self.maintenance();
+                }
             }
-            for size_class in &global.size_classes {
-                let _ = self.clear(size_class, &worker);
-            }
-            std::thread::sleep(self.config.interval);
+        }
+    }
+
+    fn maintenance(&self) {
+        for size_class in &self.global_stealer.size_classes {
+            let _ = self.clear(size_class, &self.worker);
         }
     }
 
@@ -504,11 +521,19 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
         *stealer.path.write().unwrap() = Some(path.clone());
     }
 
-    if let Some(config) = &config.background_config {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        *stealer.background_sender.lock().unwrap() = Some(sender);
-        let mut worker = BackgroundWorker::new(config.clone(), receiver);
-        spawn(move || worker.run());
+    if let Some(config) = config.background_config.clone() {
+        let mut lock = stealer.background_sender.lock().unwrap();
+
+        match &*lock {
+            Some((_, sender)) => sender.send(config).expect("Receiver exists"),
+            None => {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let mut worker = BackgroundWorker::new(receiver);
+                let join_handle = spawn(move || worker.run());
+                sender.send(config).expect("Receiver exists");
+                *lock = Some((join_handle, sender));
+            }
+        }
     }
 }
 
