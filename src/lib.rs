@@ -382,13 +382,16 @@ impl LocalSizeClass {
         let file = tempfile::tempfile_in(path)?;
         // SAFETY: Calling ftruncate on the file.
         unsafe {
-            match libc::ftruncate(
+            let ret = libc::ftruncate(
                 file.as_fd().as_raw_fd(),
                 libc::off_t::try_from(byte_len).expect("Must fit"),
-            ) {
-                0 => Ok(memmap2::MmapOptions::new().populate().map_mut(&file)?),
-                _ => Err(std::io::Error::last_os_error().into()),
+            );
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error().into());
             }
+            let mmap = memmap2::MmapOptions::new().populate().map_mut(&file)?;
+            assert_eq!(mmap.len(), byte_len);
+            Ok(mmap)
         }
     }
 }
