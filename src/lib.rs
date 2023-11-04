@@ -70,23 +70,29 @@ impl AllocError {
     }
 }
 
+/// Abstraction over size classes.
 #[derive(Clone, Copy)]
 struct SizeClass(usize);
 
 impl SizeClass {
-    fn new_unchecked(value: usize) -> Self {
+    /// Smallest supported size class
+    const MIN: SizeClass = SizeClass::new_unchecked(VALID_SIZE_CLASS.start);
+    /// Largest supported size class
+    const MAX: SizeClass = SizeClass::new_unchecked(VALID_SIZE_CLASS.end);
+
+    const fn new_unchecked(value: usize) -> Self {
         Self(value)
     }
 
-    fn index(&self) -> usize {
+    const fn index(&self) -> usize {
         self.0 - VALID_SIZE_CLASS.start
     }
 
-    fn byte_size(&self) -> usize {
+    const fn byte_size(&self) -> usize {
         1 << self.0
     }
 
-    fn from_index(index: usize) -> Self {
+    const fn from_index(index: usize) -> Self {
         Self(index + VALID_SIZE_CLASS.start)
     }
 
@@ -95,7 +101,7 @@ impl SizeClass {
         class.try_into()
     }
 
-    fn from_byte_size_unchecked(byte_size: usize) -> Self {
+    const fn from_byte_size_unchecked(byte_size: usize) -> Self {
         Self::new_unchecked(byte_size.next_power_of_two().trailing_zeros() as usize)
     }
 }
@@ -703,8 +709,6 @@ impl<T> Default for Region<T> {
 }
 
 impl<T> Region<T> {
-    const MIN_MMAP_SIZE: usize = 1 << 16;
-
     /// Create a new empty region.
     #[inline]
     #[must_use]
@@ -756,7 +760,7 @@ impl<T> Region<T> {
             return Region::new_heap(capacity);
         }
         let bytes = std::mem::size_of::<T>() * capacity;
-        if bytes < Self::MIN_MMAP_SIZE {
+        if bytes < SizeClass::MIN.byte_size() || bytes > SizeClass::MAX.byte_size() {
             Region::new_heap(capacity)
         } else {
             Region::new_mmap(capacity).unwrap_or_else(|err| {
