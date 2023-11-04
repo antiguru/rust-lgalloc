@@ -863,7 +863,8 @@ impl<T> Drop for Region<T> {
 #[cfg(test)]
 mod test {
     use crate::{lgalloc_stats, AllocError, BackgroundWorkerConfig, LgAlloc, Region};
-    use std::sync::{Arc, OnceLock, RwLock};
+    use std::sync::{Arc, OnceLock};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     static INIT: OnceLock<()> = OnceLock::new();
@@ -886,7 +887,7 @@ mod test {
     #[test]
     fn test_1() -> Result<(), AllocError> {
         initialize();
-        let mut r: Region<u8> = Region::new_mmap(4 << 20)?;
+        let mut r: Region<u8> = Region::new_auto(4 << 20);
         r.as_mut().push(1);
         drop(r);
         Ok(())
@@ -895,7 +896,7 @@ mod test {
     #[test]
     fn test_2() -> Result<(), AllocError> {
         initialize();
-        let mut r: Region<u8> = Region::new_mmap(4 << 20)?;
+        let mut r: Region<u8> = Region::new_auto(4 << 20);
         r.as_mut().push(1);
         Ok(())
     }
@@ -903,16 +904,17 @@ mod test {
     #[test]
     fn test_3() -> Result<(), AllocError> {
         initialize();
-        let until = Arc::new(RwLock::new(true));
+        let until = Arc::new(AtomicBool::new(true));
 
         let inner = || {
             let until = Arc::clone(&until);
             move || {
                 let mut i = 0;
-                while *until.read().unwrap() {
+                let until = &*until;
+                while until.load(Ordering::Relaxed) {
                     i += 1;
                     let mut r: Region<u8> =
-                        std::hint::black_box(Region::new_mmap(4 << 20)).unwrap();
+                        std::hint::black_box(Region::new_auto(4 << 20));
                     // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
                     r.as_mut().push(1);
                 }
@@ -926,7 +928,7 @@ mod test {
             std::thread::spawn(inner()),
         ];
         std::thread::sleep(Duration::from_secs(4));
-        *until.write().unwrap() = false;
+        until.store(false, Ordering::Relaxed);
         for handle in handles {
             handle.join().unwrap();
         }
@@ -937,18 +939,19 @@ mod test {
     #[test]
     fn test_4() -> Result<(), AllocError> {
         initialize();
-        let until = Arc::new(RwLock::new(true));
+        let until = Arc::new(AtomicBool::new(true));
 
         let inner = || {
             let until = Arc::clone(&until);
             move || {
                 let mut i = 0;
-                while *until.read().unwrap() {
+                let until = &*until;
+                while until.load(Ordering::Relaxed) {
                     i += 64;
                     let _ = (0..64)
                         .map(|_| {
                             let mut r: Region<u8> =
-                                std::hint::black_box(Region::new_mmap(2 << 20)).unwrap();
+                                std::hint::black_box(Region::new_auto(2 << 20));
                             // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
                             r.as_mut().push(1);
                             r
@@ -965,7 +968,7 @@ mod test {
             std::thread::spawn(inner()),
         ];
         std::thread::sleep(Duration::from_secs(4));
-        *until.write().unwrap() = false;
+        until.store(false, Ordering::Relaxed);
         for handle in handles {
             handle.join().unwrap();
         }

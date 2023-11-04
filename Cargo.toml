@@ -15,7 +15,12 @@ memmap2 = "0.5"
 tempfile = "3"
 thiserror = "1.0"
 
+[profile.release]
+debug = 2
+codegen-units = 1
+lto = true
+
 [profile.bench]
-debug = 1
+debug = 2
 codegen-units = 1
 lto = true
