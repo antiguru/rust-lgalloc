@@ -184,41 +184,6 @@ impl GlobalStealer {
             background_sender: Default::default(),
         }
     }
-
-    /// Print diagnostics about the state of the allocator.
-    #[allow(unused)]
-    fn diagnostics(&self) {
-        for (index, size_class_state) in self.size_classes.iter().enumerate() {
-            let size_class = SizeClass::from_index(index);
-            let areas = size_class_state.areas.read().unwrap();
-            if !areas.is_empty() {
-                let total: usize = areas.iter().map(|area| area.len()).sum();
-                let injector_len = size_class_state.injector.len();
-                let clean_len = size_class_state.clean_injector.len();
-                let mut free_areas = injector_len + clean_len;
-                eprintln!(
-                    "Size class {index} ({}) areas: {} global: {injector_len} chunks -clean: {clean_len} chunks",
-                    size_class.byte_size(),
-                    areas.len()
-                );
-                let stealers = size_class_state.stealers.read().unwrap();
-                for (thread, state) in &*stealers {
-                    let stealer_len = state.stealer.len();
-                    if stealer_len == 0 {
-                        continue;
-                    }
-                    free_areas += stealer_len;
-                    eprintln!("  {thread:?} {stealer_len}");
-                }
-                eprintln!(
-                    "  free info: {}/{} bytes, {free_areas}/{} chunks",
-                    free_areas * size_class.byte_size() / 1024,
-                    total / 1024,
-                    total / size_class.byte_size(),
-                );
-            }
-        }
-    }
 }
 
 impl Drop for GlobalStealer {
@@ -477,7 +442,6 @@ impl BackgroundWorker {
         let global = GlobalStealer::get_static();
 
         let worker = Worker::new_fifo();
-        let mut diagnostics = 0;
         loop {
             match self.receiver.try_recv() {
                 Ok(config) => self.config = config,
@@ -487,13 +451,6 @@ impl BackgroundWorker {
             for size_class in &global.size_classes {
                 let _ = self.clear(size_class, &worker);
             }
-            if diagnostics >= 10 {
-                if self.config.print_stats {
-                    global.diagnostics();
-                }
-                diagnostics = 0;
-            }
-            diagnostics += 1;
             std::thread::sleep(self.config.interval);
         }
     }
