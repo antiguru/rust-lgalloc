@@ -713,7 +713,6 @@ impl<T> Region<T> {
     /// Returns an error if the memory allocation fails.
     #[inline(always)]
     pub fn new_mmap(capacity: usize) -> Result<Region<T>, AllocError> {
-        // return Ok(Self::new_heap(capacity));
         // Round up to at least a page.
         let byte_len = std::cmp::max(0x1000, std::mem::size_of::<T>() * capacity);
         let size_class = SizeClass::from_byte_size(byte_len)?;
