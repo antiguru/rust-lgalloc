@@ -865,8 +865,8 @@ impl<T> Drop for Region<T> {
 #[cfg(test)]
 mod test {
     use crate::{lgalloc_stats, AllocError, BackgroundWorkerConfig, LgAlloc, Region};
-    use std::sync::{Arc, OnceLock};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
     static INIT: OnceLock<()> = OnceLock::new();
@@ -915,8 +915,7 @@ mod test {
                 let until = &*until;
                 while until.load(Ordering::Relaxed) {
                     i += 1;
-                    let mut r: Region<u8> =
-                        std::hint::black_box(Region::new_auto(4 << 20));
+                    let mut r: Region<u8> = std::hint::black_box(Region::new_auto(4 << 20));
                     // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
                     r.as_mut().push(1);
                 }
@@ -952,8 +951,7 @@ mod test {
                     i += 64;
                     let _ = (0..64)
                         .map(|_| {
-                            let mut r: Region<u8> =
-                                std::hint::black_box(Region::new_auto(2 << 20));
+                            let mut r: Region<u8> = std::hint::black_box(Region::new_auto(2 << 20));
                             // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
                             r.as_mut().push(1);
                             r

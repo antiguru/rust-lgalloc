@@ -15,6 +15,13 @@ memmap2 = "0.5"
 tempfile = "3"
 thiserror = "1.0"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "bench"
+harness = false
+
 [profile.release]
 debug = 2
 codegen-units = 1
