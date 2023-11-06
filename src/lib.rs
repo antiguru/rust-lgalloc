@@ -63,7 +63,7 @@ pub enum AllocError {
     OutOfMemory,
     /// Size class too large or small
     #[error("Invalid size class")]
-    InvalidSizeClass,
+    InvalidSizeClass(usize),
     /// Allocator disabled
     #[error("Disabled by configuration")]
     Disabled,
@@ -118,7 +118,7 @@ impl TryFrom<usize> for SizeClass {
         if VALID_SIZE_CLASS.contains(&value) {
             Ok(SizeClass(value))
         } else {
-            Err(AllocError::InvalidSizeClass)
+            Err(AllocError::InvalidSizeClass(value))
         }
     }
 }
