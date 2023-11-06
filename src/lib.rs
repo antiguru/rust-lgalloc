@@ -27,6 +27,10 @@ use memmap2::MmapMut;
 use thiserror::Error;
 
 /// Pointer to a region of memory.
+// review(guswynn): I think `&'static` is the wrong choice here, as it implies that the `Mem`
+// value is valid _past the lifetime of the underlying allocator.
+//
+// I think `NonNull<[u8]>`, while more annoying to use, would avoid accidental problems.
 type Mem = &'static mut [u8];
 
 /// The number of allocations to retain locally, per thread and size class.
@@ -44,6 +48,7 @@ pub const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_REMOVE;
 #[cfg(not(target_os = "linux"))]
 pub const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
 
+// review(guswynn): I think `type PhantomUnsyncUnsend<*mut T>` might be easier
 type PhantomUnsync = PhantomData<Cell<()>>;
 type PhantomUnsend = PhantomData<MutexGuard<'static, ()>>;
 
@@ -360,12 +365,27 @@ impl LocalSizeClass {
 
         let mut mmap = Self::init_file(byte_len)?;
         // SAFETY: Changing the lifetime of the mapping to static.
+        //
+        // review(guswynn): mistakingly doing `&*` instead of `&mut * would be transmuting a `&T` into a `&mut T`,
+        // which is instant UB:
+        // https://doc.rust-lang.org/beta/reference/behavior-considered-undefined.html
+        //
+        // using the above `NonNull` idea, would avoid this. Also on `transmute`'s I like to
+        // clearly ::<> specify the types, but here,
+        // `https://doc.rust-lang.org/stable/std/ptr/macro.addr_of_mut.html` is much better, and
+        // avoids transmute and other pointer casting footguns
         let area: Mem = unsafe { std::mem::transmute(&mut *mmap) };
         let mut chunks = area.chunks_mut(self.size_class.byte_size());
         let mem = chunks.next().expect("At least once chunk allocated.");
         for slice in chunks {
             self.size_class_state.injector.push(slice);
         }
+        // review(guswynn): whenever the `Mem` is used, I believe deref-ing the `MmapMut` is UB, as
+        // you end up with aliased pointers, so its worth a `safety: ` comment on the `state` field
+        // to ensure its not misused.
+        //
+        // however, this is where my unsafe falls over; i think it may be worth factoring some of
+        // the code out (letting us override mmap with some basic `Vec` :
         stash.push(mmap);
         Ok(mem)
     }
@@ -381,6 +401,8 @@ impl LocalSizeClass {
         };
         let file = tempfile::tempfile_in(path)?;
         // SAFETY: Calling ftruncate on the file.
+        //
+        // review(guswynn): looks good! explains that we know this is a file-backed descriptor
         unsafe {
             let ret = libc::ftruncate(
                 file.as_fd().as_raw_fd(),
@@ -389,6 +411,7 @@ impl LocalSizeClass {
             if ret != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
+            // review(guswynn): can this be in its own `unsafe` block and have a SAFETY: comment?
             let mmap = memmap2::MmapOptions::new().populate().map_mut(&file)?;
             assert_eq!(mmap.len(), byte_len);
             Ok(mmap)
@@ -396,6 +419,8 @@ impl LocalSizeClass {
     }
 }
 
+// review(guswynn): What happens if `LocalSizeClass` is leaked and we forget to send back all the
+// worker mem's? is it just a memory/file leak in that case?
 impl Drop for LocalSizeClass {
     fn drop(&mut self) {
         // Remove state associated with thread
@@ -492,6 +517,8 @@ impl BackgroundWorker {
 
     fn clear_area(mem: &mut Mem) -> std::io::Result<()> {
         // SAFETY: Calling into `madvise`
+        //
+        // review(guswynn): hmm, `libc::madvise` does document its safety requirements :(
         let ret =
             unsafe { libc::madvise(mem.as_mut_ptr().cast(), mem.len(), MADV_DONTNEED_STRATEGY) };
         if ret != 0 {
@@ -724,8 +751,26 @@ impl<T> Region<T> {
             let actual_capacity = mem.len() / std::mem::size_of::<T>();
             let ptr = mem.as_mut_ptr().cast();
             // SAFETY: memory points to suitable memory.
+            //
+            // review(guswynn): my understanding is that this is used elsewhere in columnnation,
+            // but I am not sure it correct. https://doc.rust-lang.org/std/vec/struct.Vec.html#method.from_raw_parts
+            // requires that the pointer is _from the global allocator_ as well as _exactly_ the
+            // same alignment (not less-strict)
+            //
+            // This is specifically to support correct `dealloc` case, which we never do, but it is
+            // not _guaranteed_ that there isn't UB if you violate these as well as not call
+            // `dealloc`. The docs suggest using
+            // https://doc.rust-lang.org/std/slice/fn.from_raw_parts_mut.html, which has much
+            // weaker requirements. I think this is what we should do here, and store the address
+            // of the `&mut []` (so a `*mut T` instead of assuming its `'static`. Columnation never
+            // realloc's regions, it only creates new ones and drops old ones, so i think this will
+            // be fairly east to integrate into the `Region` impl
             let new_local = unsafe { Vec::from_raw_parts(ptr, 0, actual_capacity) };
             debug_assert!(std::mem::size_of::<T>() * new_local.len() <= mem.len());
+            // review(guswynn): its unclear to me (and again, miri would help here), but I believe
+            // creating multiple &mut references is ub: https://doc.rust-lang.org/beta/reference/behavior-considered-undefined.html,
+            // which can happen whenever the vec is used. switching to all pointer or wrapping `T`
+            // in `UnsafeCell` would fix this, i believe.
             Region::MMap(new_local, Some(mem))
         })
     }
