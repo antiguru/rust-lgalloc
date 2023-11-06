@@ -13,14 +13,14 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::take;
-use std::ops::Range;
+use std::ops::{Add, Range};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
-use std::thread::{spawn, ThreadId};
-use std::time::Duration;
+use std::thread::{spawn, JoinHandle, ThreadId};
+use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use memmap2::MmapMut;
@@ -70,23 +70,29 @@ impl AllocError {
     }
 }
 
+/// Abstraction over size classes.
 #[derive(Clone, Copy)]
 struct SizeClass(usize);
 
 impl SizeClass {
-    fn new_unchecked(value: usize) -> Self {
+    /// Smallest supported size class
+    const MIN: SizeClass = SizeClass::new_unchecked(VALID_SIZE_CLASS.start);
+    /// Largest supported size class
+    const MAX: SizeClass = SizeClass::new_unchecked(VALID_SIZE_CLASS.end);
+
+    const fn new_unchecked(value: usize) -> Self {
         Self(value)
     }
 
-    fn index(&self) -> usize {
+    const fn index(&self) -> usize {
         self.0 - VALID_SIZE_CLASS.start
     }
 
-    fn byte_size(&self) -> usize {
+    const fn byte_size(&self) -> usize {
         1 << self.0
     }
 
-    fn from_index(index: usize) -> Self {
+    const fn from_index(index: usize) -> Self {
         Self(index + VALID_SIZE_CLASS.start)
     }
 
@@ -95,7 +101,7 @@ impl SizeClass {
         class.try_into()
     }
 
-    fn from_byte_size_unchecked(byte_size: usize) -> Self {
+    const fn from_byte_size_unchecked(byte_size: usize) -> Self {
         Self::new_unchecked(byte_size.next_power_of_two().trailing_zeros() as usize)
     }
 }
@@ -134,7 +140,7 @@ struct GlobalStealer {
     /// Path to store files
     path: RwLock<Option<PathBuf>>,
     /// Shared token to access background thread.
-    background_sender: Mutex<Option<std::sync::mpsc::Sender<BackgroundWorkerConfig>>>,
+    background_sender: Mutex<Option<(JoinHandle<()>, Sender<BackgroundWorkerConfig>)>>,
 }
 
 /// Per-size-class state
@@ -176,41 +182,6 @@ impl GlobalStealer {
             size_classes,
             path: Default::default(),
             background_sender: Default::default(),
-        }
-    }
-
-    /// Print diagnostics about the state of the allocator.
-    #[allow(unused)]
-    fn diagnostics(&self) {
-        for (index, size_class_state) in self.size_classes.iter().enumerate() {
-            let size_class = SizeClass::from_index(index);
-            let areas = size_class_state.areas.read().unwrap();
-            if !areas.is_empty() {
-                let total: usize = areas.iter().map(|area| area.len()).sum();
-                let injector_len = size_class_state.injector.len();
-                let clean_len = size_class_state.clean_injector.len();
-                let mut free_areas = injector_len + clean_len;
-                eprintln!(
-                    "Size class {index} ({}) areas: {} global: {injector_len} chunks -clean: {clean_len} chunks",
-                    size_class.byte_size(),
-                    areas.len()
-                );
-                let stealers = size_class_state.stealers.read().unwrap();
-                for (thread, state) in &*stealers {
-                    let stealer_len = state.stealer.len();
-                    if stealer_len == 0 {
-                        continue;
-                    }
-                    free_areas += stealer_len;
-                    eprintln!("  {thread:?} {stealer_len}");
-                }
-                eprintln!(
-                    "  free info: {}/{} bytes, {free_areas}/{} chunks",
-                    free_areas * size_class.byte_size() / 1024,
-                    total / 1024,
-                    total / size_class.byte_size(),
-                );
-            }
         }
     }
 }
@@ -411,13 +382,16 @@ impl LocalSizeClass {
         let file = tempfile::tempfile_in(path)?;
         // SAFETY: Calling ftruncate on the file.
         unsafe {
-            match libc::ftruncate(
+            let ret = libc::ftruncate(
                 file.as_fd().as_raw_fd(),
                 libc::off_t::try_from(byte_len).expect("Must fit"),
-            ) {
-                0 => Ok(memmap2::MmapOptions::new().populate().map_mut(&file)?),
-                _ => Err(std::io::Error::last_os_error().into()),
+            );
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error().into());
             }
+            let mmap = memmap2::MmapOptions::new().populate().map_mut(&file)?;
+            assert_eq!(mmap.len(), byte_len);
+            Ok(mmap)
         }
     }
 }
@@ -460,35 +434,44 @@ fn with_stealer<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
 struct BackgroundWorker {
     config: BackgroundWorkerConfig,
     receiver: Receiver<BackgroundWorkerConfig>,
+    global_stealer: &'static GlobalStealer,
+    worker: Worker<Mem>,
 }
 
 impl BackgroundWorker {
-    fn new(config: BackgroundWorkerConfig, receiver: Receiver<BackgroundWorkerConfig>) -> Self {
-        Self { config, receiver }
+    fn new(receiver: Receiver<BackgroundWorkerConfig>) -> Self {
+        let mut config = BackgroundWorkerConfig::default();
+        config.interval = Duration::MAX;
+        let global_stealer = GlobalStealer::get_static();
+        let worker = Worker::new_fifo();
+        Self {
+            config,
+            receiver,
+            global_stealer,
+            worker,
+        }
     }
 
     fn run(&mut self) {
-        let global = GlobalStealer::get_static();
-
-        let worker = Worker::new_fifo();
-        let mut diagnostics = 0;
+        let mut next_cleanup = Instant::now();
         loop {
-            match self.receiver.try_recv() {
+            match self
+                .receiver
+                .recv_timeout(next_cleanup.saturating_duration_since(Instant::now()))
+            {
                 Ok(config) => self.config = config,
-                Err(TryRecvError::Disconnected) => break,
-                Err(TryRecvError::Empty) => {}
-            }
-            for size_class in &global.size_classes {
-                let _ = self.clear(size_class, &worker);
-            }
-            if diagnostics >= 10 {
-                if self.config.print_stats {
-                    global.diagnostics();
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    next_cleanup = next_cleanup.add(self.config.interval);
+                    self.maintenance();
                 }
-                diagnostics = 0;
             }
-            diagnostics += 1;
-            std::thread::sleep(self.config.interval);
+        }
+    }
+
+    fn maintenance(&self) {
+        for size_class in &self.global_stealer.size_classes {
+            let _ = self.clear(size_class, &self.worker);
         }
     }
 
@@ -541,11 +524,19 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
         *stealer.path.write().unwrap() = Some(path.clone());
     }
 
-    if let Some(config) = &config.background_config {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        *stealer.background_sender.lock().unwrap() = Some(sender);
-        let mut worker = BackgroundWorker::new(config.clone(), receiver);
-        spawn(move || worker.run());
+    if let Some(config) = config.background_config.clone() {
+        let mut lock = stealer.background_sender.lock().unwrap();
+
+        match &*lock {
+            Some((_, sender)) => sender.send(config).expect("Receiver exists"),
+            None => {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let mut worker = BackgroundWorker::new(receiver);
+                let join_handle = spawn(move || worker.run());
+                sender.send(config).expect("Receiver exists");
+                *lock = Some((join_handle, sender));
+            }
+        }
     }
 }
 
@@ -703,8 +694,6 @@ impl<T> Default for Region<T> {
 }
 
 impl<T> Region<T> {
-    const MIN_MMAP_SIZE: usize = 1 << 16;
-
     /// Create a new empty region.
     #[inline]
     #[must_use]
@@ -727,7 +716,6 @@ impl<T> Region<T> {
     /// Returns an error if the memory allocation fails.
     #[inline(always)]
     pub fn new_mmap(capacity: usize) -> Result<Region<T>, AllocError> {
-        // return Ok(Self::new_heap(capacity));
         // Round up to at least a page.
         let byte_len = std::cmp::max(0x1000, std::mem::size_of::<T>() * capacity);
         let size_class = SizeClass::from_byte_size(byte_len)?;
@@ -756,7 +744,7 @@ impl<T> Region<T> {
             return Region::new_heap(capacity);
         }
         let bytes = std::mem::size_of::<T>() * capacity;
-        if bytes < Self::MIN_MMAP_SIZE {
+        if bytes < SizeClass::MIN.byte_size() || bytes > SizeClass::MAX.byte_size() {
             Region::new_heap(capacity)
         } else {
             Region::new_mmap(capacity).unwrap_or_else(|err| {
@@ -877,7 +865,8 @@ impl<T> Drop for Region<T> {
 #[cfg(test)]
 mod test {
     use crate::{lgalloc_stats, AllocError, BackgroundWorkerConfig, LgAlloc, Region};
-    use std::sync::{Arc, OnceLock, RwLock};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
     static INIT: OnceLock<()> = OnceLock::new();
@@ -900,7 +889,7 @@ mod test {
     #[test]
     fn test_1() -> Result<(), AllocError> {
         initialize();
-        let mut r: Region<u8> = Region::new_mmap(4 << 20)?;
+        let mut r: Region<u8> = Region::new_auto(4 << 20);
         r.as_mut().push(1);
         drop(r);
         Ok(())
@@ -909,7 +898,7 @@ mod test {
     #[test]
     fn test_2() -> Result<(), AllocError> {
         initialize();
-        let mut r: Region<u8> = Region::new_mmap(4 << 20)?;
+        let mut r: Region<u8> = Region::new_auto(4 << 20);
         r.as_mut().push(1);
         Ok(())
     }
@@ -917,16 +906,16 @@ mod test {
     #[test]
     fn test_3() -> Result<(), AllocError> {
         initialize();
-        let until = Arc::new(RwLock::new(true));
+        let until = Arc::new(AtomicBool::new(true));
 
         let inner = || {
             let until = Arc::clone(&until);
             move || {
                 let mut i = 0;
-                while *until.read().unwrap() {
+                let until = &*until;
+                while until.load(Ordering::Relaxed) {
                     i += 1;
-                    let mut r: Region<u8> =
-                        std::hint::black_box(Region::new_mmap(4 << 20)).unwrap();
+                    let mut r: Region<u8> = std::hint::black_box(Region::new_auto(4 << 20));
                     // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
                     r.as_mut().push(1);
                 }
@@ -940,7 +929,7 @@ mod test {
             std::thread::spawn(inner()),
         ];
         std::thread::sleep(Duration::from_secs(4));
-        *until.write().unwrap() = false;
+        until.store(false, Ordering::Relaxed);
         for handle in handles {
             handle.join().unwrap();
         }
@@ -951,18 +940,18 @@ mod test {
     #[test]
     fn test_4() -> Result<(), AllocError> {
         initialize();
-        let until = Arc::new(RwLock::new(true));
+        let until = Arc::new(AtomicBool::new(true));
 
         let inner = || {
             let until = Arc::clone(&until);
             move || {
                 let mut i = 0;
-                while *until.read().unwrap() {
+                let until = &*until;
+                while until.load(Ordering::Relaxed) {
                     i += 64;
                     let _ = (0..64)
                         .map(|_| {
-                            let mut r: Region<u8> =
-                                std::hint::black_box(Region::new_mmap(2 << 20)).unwrap();
+                            let mut r: Region<u8> = std::hint::black_box(Region::new_auto(2 << 20));
                             // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
                             r.as_mut().push(1);
                             r
@@ -979,7 +968,7 @@ mod test {
             std::thread::spawn(inner()),
         ];
         std::thread::sleep(Duration::from_secs(4));
-        *until.write().unwrap() = false;
+        until.store(false, Ordering::Relaxed);
         for handle in handles {
             handle.join().unwrap();
         }
