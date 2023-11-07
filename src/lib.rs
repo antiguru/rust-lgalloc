@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::{take, ManuallyDrop};
-use std::ops::{Add, Range};
+use std::ops::{Add, Deref, Range};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -36,7 +36,7 @@ use memmap2::MmapMut;
 use thiserror::Error;
 
 /// Pointer to a region of memory.
-pub struct Mem {
+struct Mem {
     ptr: NonNull<[u8]>,
 }
 
@@ -304,8 +304,9 @@ struct LocalSizeClass {
     size_class_state: &'static SizeClassState,
     /// Owning thread's ID
     thread_id: ThreadId,
-    _phantom: PhantomUnsyncUnsend<Self>,
+    /// Shared statistics maintained by this thread.
     stats: Arc<AllocStats>,
+    _phantom: PhantomUnsyncUnsend<Self>,
 }
 
 impl LocalSizeClass {
@@ -474,15 +475,15 @@ impl Drop for LocalSizeClass {
             self.stats.allocations.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        self.size_class_state
-            .alloc_stats
+        let global_stats = &self.size_class_state.alloc_stats;
+        global_stats
             .refill
             .fetch_add(self.stats.refill.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.size_class_state.alloc_stats.slow_path.fetch_add(
+        global_stats.slow_path.fetch_add(
             self.stats.slow_path.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        self.size_class_state.alloc_stats.deallocations.fetch_add(
+        global_stats.deallocations.fetch_add(
             self.stats.deallocations.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
@@ -735,7 +736,26 @@ pub enum Region<T> {
     /// A possibly empty heap-allocated region, represented as a vector.
     Heap(Vec<T>),
     /// A mmaped region, represented by a vector and its backing memory mapping.
-    MMap(ManuallyDrop<Vec<T>>, Option<Mem>),
+    MMap(MMapRegion<T>),
+}
+
+pub struct MMapRegion<T> {
+    inner: ManuallyDrop<Vec<T>>,
+    mem: Option<Mem>,
+}
+
+impl<T> MMapRegion<T> {
+    unsafe fn clear(&mut self) {
+        self.inner.set_len(0);
+    }
+}
+
+impl<T> Deref for MMapRegion<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl<T> Default for Region<T> {
@@ -790,7 +810,10 @@ impl<T> Region<T> {
             // SAFETY: memory points to suitable memory.
             let new_local = unsafe { Vec::from_raw_parts(ptr, 0, actual_capacity) };
             debug_assert!(std::mem::size_of::<T>() * new_local.len() <= mem.len());
-            Ok(Region::MMap(ManuallyDrop::new(new_local), Some(mem)))
+            Ok(Region::MMap(MMapRegion {
+                inner: ManuallyDrop::new(new_local),
+                mem: Some(mem),
+            }))
         })
     }
 
@@ -829,7 +852,7 @@ impl<T> Region<T> {
     pub unsafe fn clear(&mut self) {
         match self {
             Region::Heap(vec) => vec.set_len(0),
-            Region::MMap(vec, _) => vec.set_len(0),
+            Region::MMap(inner) => inner.clear(),
         }
     }
 
@@ -839,7 +862,7 @@ impl<T> Region<T> {
     pub fn capacity(&self) -> usize {
         match self {
             Region::Heap(vec) => vec.capacity(),
-            Region::MMap(vec, _) => vec.capacity(),
+            Region::MMap(inner) => inner.inner.capacity(),
         }
     }
 
@@ -849,7 +872,7 @@ impl<T> Region<T> {
     pub fn len(&self) -> usize {
         match self {
             Region::Heap(vec) => vec.len(),
-            Region::MMap(vec, _) => vec.len(),
+            Region::MMap(inner) => inner.len(),
         }
     }
 
@@ -859,7 +882,7 @@ impl<T> Region<T> {
     pub fn is_empty(&self) -> bool {
         match self {
             Region::Heap(vec) => vec.is_empty(),
-            Region::MMap(vec, _) => vec.is_empty(),
+            Region::MMap(inner) => inner.is_empty(),
         }
     }
 
@@ -869,7 +892,7 @@ impl<T> Region<T> {
     pub fn as_vec(&self) -> &Vec<T> {
         match self {
             Region::Heap(vec) => vec,
-            Region::MMap(vec, _) => vec,
+            Region::MMap(inner) => &inner.inner,
         }
     }
 }
@@ -879,7 +902,7 @@ impl<T> AsMut<Vec<T>> for Region<T> {
     fn as_mut(&mut self) -> &mut Vec<T> {
         match self {
             Region::Heap(vec) => vec,
-            Region::MMap(vec, _) => &mut *vec,
+            Region::MMap(inner) => &mut inner.inner,
         }
     }
 }
@@ -922,40 +945,44 @@ impl<T> Drop for Region<T> {
                 // SAFETY: Don't drop the elements, drop the vec.
                 unsafe { vec.set_len(0) }
             }
-            Region::MMap(_vec, mmap) => {
-                // Forget reasoning: The vector points to the mapped region, which frees the
-                // allocation. Don't drop elements, don't drop vec.
-                with_stealer(|s| s.push(std::mem::take(mmap).unwrap()));
-            }
+            Region::MMap(_) => {}
         }
+    }
+}
+
+impl<T> Drop for MMapRegion<T> {
+    fn drop(&mut self) {
+        // Forget reasoning: The vector points to the mapped region, which frees the
+        // allocation. Don't drop elements, don't drop vec.
+        with_stealer(|s| s.push(take(&mut self.mem).unwrap()));
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::{lgalloc_stats, AllocError, BackgroundWorkerConfig, LgAlloc, Region};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    static INIT: OnceLock<()> = OnceLock::new();
+    use serial_test::serial;
+
+    use crate::{AllocError, BackgroundWorkerConfig, LgAlloc, Region};
 
     fn initialize() {
-        INIT.get_or_init(|| {
-            crate::lgalloc_set_config(
-                LgAlloc::new()
-                    .enable()
-                    .with_background_config(BackgroundWorkerConfig {
-                        interval: Duration::from_secs(1),
-                        batch: 32,
-                        print_stats: false,
-                    })
-                    .with_path(std::env::temp_dir()),
-            );
-        });
+        crate::lgalloc_set_config(
+            LgAlloc::new()
+                .enable()
+                .with_background_config(BackgroundWorkerConfig {
+                    interval: Duration::from_secs(1),
+                    batch: 32,
+                    print_stats: false,
+                })
+                .with_path(std::env::temp_dir()),
+        );
     }
 
     #[test]
+    #[serial]
     fn test_1() -> Result<(), AllocError> {
         initialize();
         let mut r: Region<u8> = Region::new_auto(4 << 20);
@@ -965,6 +992,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_2() -> Result<(), AllocError> {
         initialize();
         let mut r: Region<u8> = Region::new_auto(4 << 20);
@@ -973,6 +1001,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_3() -> Result<(), AllocError> {
         initialize();
         let until = Arc::new(AtomicBool::new(true));
@@ -1007,6 +1036,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_4() -> Result<(), AllocError> {
         initialize();
         let until = Arc::new(AtomicBool::new(true));
@@ -1043,8 +1073,23 @@ mod test {
         }
         std::thread::sleep(Duration::from_secs(1));
         let mut stats = Default::default();
-        lgalloc_stats(&mut stats);
+        crate::lgalloc_stats(&mut stats);
         println!("stats: {stats:?}");
         Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn leak() {
+        crate::lgalloc_set_config(&crate::LgAlloc {
+            enabled: Some(true),
+            path: Some(std::env::temp_dir()),
+            background_config: None,
+        });
+        let r = Region::<i32>::new_mmap(10000).unwrap();
+
+        let thread = std::thread::spawn(move || drop(r));
+
+        thread.join().unwrap();
     }
 }
