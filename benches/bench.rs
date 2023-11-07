@@ -40,7 +40,7 @@ fn bench_1(c: &mut Criterion) {
 
 fn bench_many(c: &mut Criterion) {
     initialize();
-    let mut group = c.benchmark_group(&format!("allocate"));
+    let mut group = c.benchmark_group("allocate");
     for count in [8, 16, 24, 32, 48, 64, 96, 128] {
         let mut storage = Vec::with_capacity(count);
         for size_class in [2, 16] {

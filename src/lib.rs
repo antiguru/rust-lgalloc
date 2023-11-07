@@ -8,17 +8,26 @@
 //!
 //! This library is very unsafe on account of `unsafe` and interacting directly
 //! with libc, including Linux extension.
+//!
+//! The library relies on memory-mapped files. Users of this file must not fork the process
+//! because otherwise two processes would share the same mappings, causing undefined behavior
+//! because the mutable pointers would not be unique anymore. Unfortunately, there is no way
+//! to tell the memory subsystem that the shared mappings must not be inherited.
+//!
+//! Clients must not lock pages (`mlock`), or need to unlock the pages before returning them
+//! to lgalloc.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::mem::take;
-use std::ops::{Add, Range};
+use std::mem::{take, ManuallyDrop};
+use std::ops::{Add, Deref, DerefMut, Range};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{spawn, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
@@ -27,7 +36,49 @@ use memmap2::MmapMut;
 use thiserror::Error;
 
 /// Pointer to a region of memory.
-type Mem = &'static mut [u8];
+struct Mem {
+    /// The actual pointer.
+    ptr: NonNull<[u8]>,
+}
+
+unsafe impl Send for Mem {}
+
+impl Mem {
+    /// Length of the memory area in bytes.
+    fn len(&self) -> usize {
+        self.ptr.len()
+    }
+
+    /// Indicate that the memory is not in use and that the OS can recycle it.
+    fn clear(&mut self) -> std::io::Result<()> {
+        // SAFETY: Calling into `madvise`:
+        // * The ptr is page-aligned by construction.
+        // * The ptr + length is page-aligned by construction (not required but surprising otherwise)
+        // * Mapped shared and writable (for MADV_REMOVE),
+        // * Pages not locked.
+        let ret = unsafe {
+            libc::madvise(
+                self.ptr.as_ptr().cast(),
+                self.ptr.len(),
+                MADV_DONTNEED_STRATEGY,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("madvise failed: {ret} {err:?}",);
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+impl From<&mut [u8]> for Mem {
+    fn from(value: &mut [u8]) -> Self {
+        Self {
+            ptr: NonNull::new(value).expect("Mapped memory ptr not null"),
+        }
+    }
+}
 
 /// The number of allocations to retain locally, per thread and size class.
 const LOCAL_BUFFER: usize = 32;
@@ -38,14 +89,17 @@ const INITIAL_SIZE: usize = 32 << 20;
 /// Range of valid size classes.
 pub const VALID_SIZE_CLASS: Range<usize> = 16..33;
 
+/// Strategy to indicate that the OS can reclaim pages
+// TODO: On Linux, we want to use MADV_REMOVE, but that's only supported
+// on file systems that supports FALLOC_FL_PUNCH_HOLE. We should check
+// the return value and retry EOPNOTSUPP with MADV_DONTNEED.
 #[cfg(target_os = "linux")]
-pub const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_REMOVE;
+const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_REMOVE;
 
 #[cfg(not(target_os = "linux"))]
-pub const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
+const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
 
-type PhantomUnsync = PhantomData<Cell<()>>;
-type PhantomUnsend = PhantomData<MutexGuard<'static, ()>>;
+type PhantomUnsyncUnsend<T> = PhantomData<*mut T>;
 
 /// Allocation errors
 #[derive(Error, Debug)]
@@ -58,13 +112,16 @@ pub enum AllocError {
     OutOfMemory,
     /// Size class too large or small
     #[error("Invalid size class")]
-    InvalidSizeClass,
+    InvalidSizeClass(usize),
     /// Allocator disabled
     #[error("Disabled by configuration")]
     Disabled,
+    #[error("Memory unsuitable for requested alignment")]
+    UnalignedMemory,
 }
 
 impl AllocError {
+    /// Check if this error is [`AllocError::Disabled`].
     pub fn is_disabled(&self) -> bool {
         matches!(self, AllocError::Disabled)
     }
@@ -113,7 +170,7 @@ impl TryFrom<usize> for SizeClass {
         if VALID_SIZE_CLASS.contains(&value) {
             Ok(SizeClass(value))
         } else {
-            Err(AllocError::InvalidSizeClass)
+            Err(AllocError::InvalidSizeClass(value))
         }
     }
 }
@@ -147,7 +204,9 @@ struct GlobalStealer {
 #[derive(Default)]
 struct SizeClassState {
     /// Handle to memory-mapped regions.
-    areas: RwLock<Vec<MmapMut>>,
+    ///
+    /// We must never dereference the memory-mapped regions stored here.
+    areas: RwLock<Vec<ManuallyDrop<MmapMut>>>,
     /// Injector to distribute memory globally.
     injector: Injector<Mem>,
     /// Injector to distribute memory globally, freed memory.
@@ -201,7 +260,7 @@ struct PerThreadState<T> {
 struct ThreadLocalStealer {
     /// Per-size-class state
     size_classes: Vec<LocalSizeClass>,
-    _phantom: (PhantomUnsend, PhantomUnsync),
+    _phantom: PhantomUnsyncUnsend<Self>,
 }
 
 impl ThreadLocalStealer {
@@ -212,10 +271,14 @@ impl ThreadLocalStealer {
             .collect();
         Self {
             size_classes,
-            _phantom: (PhantomData, PhantomData),
+            _phantom: PhantomData,
         }
     }
 
+    /// Allocate a memory region from a specific size class.
+    ///
+    /// Returns [`AllocError::Disabled`] if lgalloc is not enabled. Returns other error types
+    /// if out of memory, or an internal operation fails.
     fn get(&mut self, size_class: SizeClass) -> Result<Mem, AllocError> {
         if !LGALLOC_ENABLED.load(Ordering::Relaxed) {
             return Err(AllocError::Disabled);
@@ -223,6 +286,7 @@ impl ThreadLocalStealer {
         self.size_classes[size_class.index()].get_with_refill()
     }
 
+    /// Return memory to the allocator. Must have been obtained through `get`.
     fn push(&self, mem: Mem) {
         let size_class = SizeClass::from_byte_size_unchecked(mem.len());
 
@@ -235,6 +299,11 @@ thread_local! {
 }
 
 /// Per-thread, per-size-class state
+///
+/// # Safety
+///
+/// We store parts of areas in this struct. Leaking this struct leaks the areas, which is safe
+/// because we will never try to access or reclaim them.
 struct LocalSizeClass {
     /// Local memory queue.
     worker: Worker<Mem>,
@@ -244,8 +313,9 @@ struct LocalSizeClass {
     size_class_state: &'static SizeClassState,
     /// Owning thread's ID
     thread_id: ThreadId,
-    _phantom: (PhantomUnsend, PhantomUnsync),
+    /// Shared statistics maintained by this thread.
     stats: Arc<AllocStats>,
+    _phantom: PhantomUnsyncUnsend<Self>,
 }
 
 impl LocalSizeClass {
@@ -272,7 +342,7 @@ impl LocalSizeClass {
             size_class_state,
             thread_id,
             stats,
-            _phantom: (PhantomData, PhantomData),
+            _phantom: PhantomData,
         }
     }
 
@@ -359,14 +429,15 @@ impl LocalSizeClass {
         );
 
         let mut mmap = Self::init_file(byte_len)?;
-        // SAFETY: Changing the lifetime of the mapping to static.
-        let area: Mem = unsafe { std::mem::transmute(&mut *mmap) };
-        let mut chunks = area.chunks_mut(self.size_class.byte_size());
-        let mem = chunks.next().expect("At least once chunk allocated.");
+        let mut chunks = mmap.as_mut().chunks_mut(self.size_class.byte_size());
+        let mem = chunks
+            .next()
+            .expect("At least once chunk allocated.")
+            .into();
         for slice in chunks {
-            self.size_class_state.injector.push(slice);
+            self.size_class_state.injector.push(slice.into());
         }
-        stash.push(mmap);
+        stash.push(ManuallyDrop::new(mmap));
         Ok(mem)
     }
 
@@ -380,7 +451,7 @@ impl LocalSizeClass {
             )));
         };
         let file = tempfile::tempfile_in(path)?;
-        // SAFETY: Calling ftruncate on the file.
+        // SAFETY: Calling ftruncate on the file, which we just created.
         unsafe {
             let ret = libc::ftruncate(
                 file.as_fd().as_raw_fd(),
@@ -389,10 +460,11 @@ impl LocalSizeClass {
             if ret != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
-            let mmap = memmap2::MmapOptions::new().populate().map_mut(&file)?;
-            assert_eq!(mmap.len(), byte_len);
-            Ok(mmap)
         }
+        // SAFETY: We only map `file` once, and never share it with other processes.
+        let mmap = unsafe { memmap2::MmapOptions::new().populate().map_mut(&file)? };
+        assert_eq!(mmap.len(), byte_len);
+        Ok(mmap)
     }
 }
 
@@ -412,15 +484,15 @@ impl Drop for LocalSizeClass {
             self.stats.allocations.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        self.size_class_state
-            .alloc_stats
+        let global_stats = &self.size_class_state.alloc_stats;
+        global_stats
             .refill
             .fetch_add(self.stats.refill.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.size_class_state.alloc_stats.slow_path.fetch_add(
+        global_stats.slow_path.fetch_add(
             self.stats.slow_path.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        self.size_class_state.alloc_stats.deallocations.fetch_add(
+        global_stats.deallocations.fetch_add(
             self.stats.deallocations.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
@@ -440,8 +512,10 @@ struct BackgroundWorker {
 
 impl BackgroundWorker {
     fn new(receiver: Receiver<BackgroundWorkerConfig>) -> Self {
-        let mut config = BackgroundWorkerConfig::default();
-        config.interval = Duration::MAX;
+        let config = BackgroundWorkerConfig {
+            interval: Duration::MAX,
+            ..Default::default()
+        };
         let global_stealer = GlobalStealer::get_static();
         let worker = Worker::new_fifo();
         Self {
@@ -481,25 +555,13 @@ impl BackgroundWorker {
             .steal_batch_with_limit(worker, self.config.batch);
         let mut count = 0;
         while let Some(mut mem) = worker.pop() {
-            match Self::clear_area(&mut mem) {
+            match mem.clear() {
                 Ok(()) => count += 1,
                 Err(e) => panic!("Syscall failed: {e:?}"),
             }
             size_class.clean_injector.push(mem);
         }
         count
-    }
-
-    fn clear_area(mem: &mut Mem) -> std::io::Result<()> {
-        // SAFETY: Calling into `madvise`
-        let ret =
-            unsafe { libc::madvise(mem.as_mut_ptr().cast(), mem.len(), MADV_DONTNEED_STRATEGY) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            eprintln!("madvise failed: {ret} {err:?}",);
-            return Err(err);
-        }
-        Ok(())
     }
 }
 
@@ -547,8 +609,6 @@ pub struct BackgroundWorkerConfig {
     pub interval: Duration,
     /// How many allocations to clear per size class.
     pub batch: usize,
-    /// Enable debug stat printing.
-    pub print_stats: bool,
 }
 
 /// Lgalloc configuration
@@ -649,6 +709,7 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
 
 #[derive(Debug, Default)]
 pub struct LgAllocStats {
+    /// Per size-class statistics.
     pub size_class: Vec<SizeClassStats>,
 }
 
@@ -683,7 +744,30 @@ pub enum Region<T> {
     /// A possibly empty heap-allocated region, represented as a vector.
     Heap(Vec<T>),
     /// A mmaped region, represented by a vector and its backing memory mapping.
-    MMap(Vec<T>, Option<Mem>),
+    MMap(MMapRegion<T>),
+}
+
+/// Type encapsulating private data for memory-mapped regions.
+pub struct MMapRegion<T> {
+    /// Vector-representation of the underlying memory. Must not be dropped.
+    inner: ManuallyDrop<Vec<T>>,
+    /// The actual memory, so we can recycle it. Option to allow moving.
+    mem: Option<Mem>,
+}
+
+impl<T> MMapRegion<T> {
+    /// Clear the contents of this region without dropping elements.
+    unsafe fn clear(&mut self) {
+        self.inner.set_len(0);
+    }
+}
+
+impl<T> Deref for MMapRegion<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl<T> Default for Region<T> {
@@ -716,17 +800,32 @@ impl<T> Region<T> {
     /// Returns an error if the memory allocation fails.
     #[inline(always)]
     pub fn new_mmap(capacity: usize) -> Result<Region<T>, AllocError> {
+        if std::mem::size_of::<T>() == 0 || capacity == 0 {
+            // Handle zero-sized types.
+            return Ok(Region::new_heap(capacity));
+        }
+
         // Round up to at least a page.
+        // TODO: This assumes 4k pages.
         let byte_len = std::cmp::max(0x1000, std::mem::size_of::<T>() * capacity);
         let size_class = SizeClass::from_byte_size(byte_len)?;
-        with_stealer(|s| s.get(size_class)).map(|mem| {
+
+        with_stealer(|s| s.get(size_class)).and_then(|mem| {
             debug_assert_eq!(mem.len(), size_class.byte_size());
             let actual_capacity = mem.len() / std::mem::size_of::<T>();
-            let ptr = mem.as_mut_ptr().cast();
+            let ptr: *mut T = mem.ptr.cast().as_ptr();
+            // Memory region should be page-aligned, which we assume to be larger than any alignment
+            // we might encounter. If this is not the case, bail out.
+            if ptr.align_offset(std::mem::align_of::<T>()) != 0 {
+                return Err(AllocError::UnalignedMemory);
+            }
             // SAFETY: memory points to suitable memory.
-            let new_local = unsafe { Vec::from_raw_parts(ptr, 0, actual_capacity) };
-            debug_assert!(std::mem::size_of::<T>() * new_local.len() <= mem.len());
-            Region::MMap(new_local, Some(mem))
+            let inner = ManuallyDrop::new(unsafe { Vec::from_raw_parts(ptr, 0, actual_capacity) });
+            debug_assert!(std::mem::size_of::<T>() * inner.len() <= mem.len());
+            Ok(Region::MMap(MMapRegion {
+                inner,
+                mem: Some(mem),
+            }))
         })
     }
 
@@ -764,7 +863,8 @@ impl<T> Region<T> {
     #[inline]
     pub unsafe fn clear(&mut self) {
         match self {
-            Region::Heap(vec) | Region::MMap(vec, _) => vec.set_len(0),
+            Region::Heap(vec) => vec.set_len(0),
+            Region::MMap(inner) => inner.clear(),
         }
     }
 
@@ -773,7 +873,8 @@ impl<T> Region<T> {
     #[must_use]
     pub fn capacity(&self) -> usize {
         match self {
-            Region::Heap(vec) | Region::MMap(vec, _) => vec.capacity(),
+            Region::Heap(vec) => vec.capacity(),
+            Region::MMap(inner) => inner.inner.capacity(),
         }
     }
 
@@ -782,7 +883,8 @@ impl<T> Region<T> {
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
-            Region::Heap(vec) | Region::MMap(vec, _) => vec.len(),
+            Region::Heap(vec) => vec.len(),
+            Region::MMap(inner) => inner.len(),
         }
     }
 
@@ -791,7 +893,8 @@ impl<T> Region<T> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
-            Region::Heap(vec) | Region::MMap(vec, _) => vec.is_empty(),
+            Region::Heap(vec) => vec.is_empty(),
+            Region::MMap(inner) => inner.is_empty(),
         }
     }
 
@@ -800,16 +903,22 @@ impl<T> Region<T> {
     #[must_use]
     pub fn as_vec(&self) -> &Vec<T> {
         match self {
-            Region::Heap(vec) | Region::MMap(vec, _) => vec,
+            Region::Heap(vec) => vec,
+            Region::MMap(inner) => &inner.inner,
         }
     }
-}
 
-impl<T> AsMut<Vec<T>> for Region<T> {
+    #[inline]
+    pub fn extend<I: IntoIterator<Item = T> + ExactSizeIterator>(&mut self, iter: I) {
+        debug_assert!(self.capacity() - self.len() >= iter.len());
+        self.as_mut().extend(iter);
+    }
+
     #[inline]
     fn as_mut(&mut self) -> &mut Vec<T> {
         match self {
-            Region::Heap(vec) | Region::MMap(vec, _) => vec,
+            Region::Heap(vec) => vec,
+            Region::MMap(inner) => &mut inner.inner,
         }
     }
 }
@@ -817,18 +926,12 @@ impl<T> AsMut<Vec<T>> for Region<T> {
 impl<T: Clone> Region<T> {
     #[inline]
     pub fn extend_from_slice(&mut self, slice: &[T]) {
+        debug_assert!(self.capacity() - self.len() >= slice.len());
         self.as_mut().extend_from_slice(slice);
     }
 }
 
-impl<T> Extend<T> for Region<T> {
-    #[inline]
-    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        self.as_mut().extend(iter);
-    }
-}
-
-impl<T> std::ops::Deref for Region<T> {
+impl<T> Deref for Region<T> {
     type Target = [T];
 
     #[inline]
@@ -837,7 +940,7 @@ impl<T> std::ops::Deref for Region<T> {
     }
 }
 
-impl<T> std::ops::DerefMut for Region<T> {
+impl<T> DerefMut for Region<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut()
@@ -852,41 +955,43 @@ impl<T> Drop for Region<T> {
                 // SAFETY: Don't drop the elements, drop the vec.
                 unsafe { vec.set_len(0) }
             }
-            Region::MMap(vec, mmap) => {
-                // Forget reasoning: The vector points to the mapped region, which frees the
-                // allocation. Don't drop elements, don't drop vec.
-                std::mem::forget(std::mem::take(vec));
-                with_stealer(|s| s.push(std::mem::take(mmap).unwrap()));
-            }
+            Region::MMap(_) => {}
         }
+    }
+}
+
+impl<T> Drop for MMapRegion<T> {
+    fn drop(&mut self) {
+        // Forget reasoning: The vector points to the mapped region, which frees the
+        // allocation. Don't drop elements, don't drop vec.
+        with_stealer(|s| s.push(take(&mut self.mem).unwrap()));
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::{lgalloc_stats, AllocError, BackgroundWorkerConfig, LgAlloc, Region};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    static INIT: OnceLock<()> = OnceLock::new();
+    use serial_test::serial;
+
+    use crate::{AllocError, BackgroundWorkerConfig, LgAlloc, Region};
 
     fn initialize() {
-        INIT.get_or_init(|| {
-            crate::lgalloc_set_config(
-                LgAlloc::new()
-                    .enable()
-                    .with_background_config(BackgroundWorkerConfig {
-                        interval: Duration::from_secs(1),
-                        batch: 32,
-                        print_stats: false,
-                    })
-                    .with_path(std::env::temp_dir()),
-            );
-        });
+        crate::lgalloc_set_config(
+            LgAlloc::new()
+                .enable()
+                .with_background_config(BackgroundWorkerConfig {
+                    interval: Duration::from_secs(1),
+                    batch: 32,
+                })
+                .with_path(std::env::temp_dir()),
+        );
     }
 
     #[test]
+    #[serial]
     fn test_1() -> Result<(), AllocError> {
         initialize();
         let mut r: Region<u8> = Region::new_auto(4 << 20);
@@ -896,6 +1001,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_2() -> Result<(), AllocError> {
         initialize();
         let mut r: Region<u8> = Region::new_auto(4 << 20);
@@ -904,6 +1010,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_3() -> Result<(), AllocError> {
         initialize();
         let until = Arc::new(AtomicBool::new(true));
@@ -938,6 +1045,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_4() -> Result<(), AllocError> {
         initialize();
         let until = Arc::new(AtomicBool::new(true));
@@ -974,8 +1082,23 @@ mod test {
         }
         std::thread::sleep(Duration::from_secs(1));
         let mut stats = Default::default();
-        lgalloc_stats(&mut stats);
+        crate::lgalloc_stats(&mut stats);
         println!("stats: {stats:?}");
         Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn leak() {
+        crate::lgalloc_set_config(&crate::LgAlloc {
+            enabled: Some(true),
+            path: Some(std::env::temp_dir()),
+            background_config: None,
+        });
+        let r = Region::<i32>::new_mmap(10000).unwrap();
+
+        let thread = std::thread::spawn(move || drop(r));
+
+        thread.join().unwrap();
     }
 }
