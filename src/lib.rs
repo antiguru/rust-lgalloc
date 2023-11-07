@@ -895,11 +895,17 @@ impl<T> Drop for Region<T> {
         match self {
             Region::Heap(vec) => {
                 // SAFETY: Don't drop the elements, drop the vec.
+                // review(guswynn): is this not a leak? this is just a normal vector,
+                // so those elements are lost forever...is the intention to instead
+                // back this with a `StableRegion`?
                 unsafe { vec.set_len(0) }
             }
             Region::MMap(vec, mmap) => {
                 // Forget reasoning: The vector points to the mapped region, which frees the
                 // allocation. Don't drop elements, don't drop vec.
+                //
+                // review(guswynn): wrapping the vec in `ManuallyDrop` would make this harder
+                // to forget (pun intended) to do!
                 std::mem::forget(std::mem::take(vec));
                 with_stealer(|s| s.push(std::mem::take(mmap).unwrap()));
             }
