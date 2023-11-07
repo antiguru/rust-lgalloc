@@ -202,7 +202,7 @@ struct SizeClassState {
     /// Handle to memory-mapped regions.
     ///
     /// We must never dereference the memory-mapped regions stored here.
-    areas: RwLock<Vec<MmapMut>>,
+    areas: RwLock<Vec<ManuallyDrop<MmapMut>>>,
     /// Injector to distribute memory globally.
     injector: Injector<Mem>,
     /// Injector to distribute memory globally, freed memory.
@@ -428,7 +428,7 @@ impl LocalSizeClass {
         for slice in chunks {
             self.size_class_state.injector.push(slice.into());
         }
-        stash.push(mmap);
+        stash.push(ManuallyDrop::new(mmap));
         Ok(mem)
     }
 
