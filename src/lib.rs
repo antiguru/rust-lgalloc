@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::{take, ManuallyDrop};
-use std::ops::{Add, Deref, Range};
+use std::ops::{Add, Deref, DerefMut, Range};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -801,17 +801,17 @@ impl<T> Region<T> {
         with_stealer(|s| s.get(size_class)).and_then(|mem| {
             debug_assert_eq!(mem.len(), size_class.byte_size());
             let actual_capacity = mem.len() / std::mem::size_of::<T>();
-            let ptr: *mut T = mem.ptr.as_ptr().cast();
+            let ptr: *mut T = mem.ptr.cast().as_ptr();
             // Memory region should be page-aligned, which we assume to be larger than any alignment
             // we might encounter. If this is not the case, bail out.
             if ptr.align_offset(std::mem::align_of::<T>()) != 0 {
                 return Err(AllocError::UnalignedMemory);
             }
             // SAFETY: memory points to suitable memory.
-            let new_local = unsafe { Vec::from_raw_parts(ptr, 0, actual_capacity) };
-            debug_assert!(std::mem::size_of::<T>() * new_local.len() <= mem.len());
+            let inner = ManuallyDrop::new(unsafe { Vec::from_raw_parts(ptr, 0, actual_capacity) });
+            debug_assert!(std::mem::size_of::<T>() * inner.len() <= mem.len());
             Ok(Region::MMap(MMapRegion {
-                inner: ManuallyDrop::new(new_local),
+                inner,
                 mem: Some(mem),
             }))
         })
@@ -895,9 +895,13 @@ impl<T> Region<T> {
             Region::MMap(inner) => &inner.inner,
         }
     }
-}
 
-impl<T> AsMut<Vec<T>> for Region<T> {
+    #[inline]
+    pub fn extend<I: IntoIterator<Item = T> + ExactSizeIterator>(&mut self, iter: I) {
+        debug_assert!(self.capacity() - self.len() >= iter.len());
+        self.as_mut().extend(iter);
+    }
+
     #[inline]
     fn as_mut(&mut self) -> &mut Vec<T> {
         match self {
@@ -910,18 +914,12 @@ impl<T> AsMut<Vec<T>> for Region<T> {
 impl<T: Clone> Region<T> {
     #[inline]
     pub fn extend_from_slice(&mut self, slice: &[T]) {
+        debug_assert!(self.capacity() - self.len() >= slice.len());
         self.as_mut().extend_from_slice(slice);
     }
 }
 
-impl<T> Extend<T> for Region<T> {
-    #[inline]
-    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        self.as_mut().extend(iter);
-    }
-}
-
-impl<T> std::ops::Deref for Region<T> {
+impl<T> Deref for Region<T> {
     type Target = [T];
 
     #[inline]
@@ -930,7 +928,7 @@ impl<T> std::ops::Deref for Region<T> {
     }
 }
 
-impl<T> std::ops::DerefMut for Region<T> {
+impl<T> DerefMut for Region<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut()
