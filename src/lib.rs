@@ -37,16 +37,19 @@ use thiserror::Error;
 
 /// Pointer to a region of memory.
 struct Mem {
+    /// The actual pointer.
     ptr: NonNull<[u8]>,
 }
 
 unsafe impl Send for Mem {}
 
 impl Mem {
+    /// Length of the memory area in bytes.
     fn len(&self) -> usize {
         self.ptr.len()
     }
 
+    /// Indicate that the memory is not in use and that the OS can recycle it.
     fn clear(&mut self) -> std::io::Result<()> {
         // SAFETY: Calling into `madvise`:
         // * The ptr is page-aligned by construction.
@@ -118,6 +121,7 @@ pub enum AllocError {
 }
 
 impl AllocError {
+    /// Check if this error is [`AllocError::Disabled`].
     pub fn is_disabled(&self) -> bool {
         matches!(self, AllocError::Disabled)
     }
@@ -271,6 +275,10 @@ impl ThreadLocalStealer {
         }
     }
 
+    /// Allocate a memory region from a specific size class.
+    ///
+    /// Returns [`AllocError::Disabled`] if lgalloc is not enabled. Returns other error types
+    /// if out of memory, or an internal operation fails.
     fn get(&mut self, size_class: SizeClass) -> Result<Mem, AllocError> {
         if !LGALLOC_ENABLED.load(Ordering::Relaxed) {
             return Err(AllocError::Disabled);
@@ -278,6 +286,7 @@ impl ThreadLocalStealer {
         self.size_classes[size_class.index()].get_with_refill()
     }
 
+    /// Return memory to the allocator. Must have been obtained through `get`.
     fn push(&self, mem: Mem) {
         let size_class = SizeClass::from_byte_size_unchecked(mem.len());
 
@@ -600,8 +609,6 @@ pub struct BackgroundWorkerConfig {
     pub interval: Duration,
     /// How many allocations to clear per size class.
     pub batch: usize,
-    /// Enable debug stat printing.
-    pub print_stats: bool,
 }
 
 /// Lgalloc configuration
@@ -702,6 +709,7 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
 
 #[derive(Debug, Default)]
 pub struct LgAllocStats {
+    /// Per size-class statistics.
     pub size_class: Vec<SizeClassStats>,
 }
 
@@ -739,12 +747,16 @@ pub enum Region<T> {
     MMap(MMapRegion<T>),
 }
 
+/// Type encapsulating private data for memory-mapped regions.
 pub struct MMapRegion<T> {
+    /// Vector-representation of the underlying memory. Must not be dropped.
     inner: ManuallyDrop<Vec<T>>,
+    /// The actual memory, so we can recycle it. Option to allow moving.
     mem: Option<Mem>,
 }
 
 impl<T> MMapRegion<T> {
+    /// Clear the contents of this region without dropping elements.
     unsafe fn clear(&mut self) {
         self.inner.set_len(0);
     }
@@ -973,7 +985,6 @@ mod test {
                 .with_background_config(BackgroundWorkerConfig {
                     interval: Duration::from_secs(1),
                     batch: 32,
-                    print_stats: false,
                 })
                 .with_path(std::env::temp_dir()),
         );
