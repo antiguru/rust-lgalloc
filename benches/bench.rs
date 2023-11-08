@@ -13,7 +13,6 @@ fn initialize() {
                 .with_background_config(lgalloc::BackgroundWorkerConfig {
                     interval: Duration::from_secs(1),
                     batch: 32,
-                    print_stats: false,
                 })
                 .with_path(std::env::temp_dir()),
         );
