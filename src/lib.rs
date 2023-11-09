@@ -26,7 +26,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, Sender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{spawn, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
@@ -520,16 +520,19 @@ impl BackgroundWorker {
     }
 
     fn run(&mut self) {
-        let mut next_cleanup = Instant::now();
+        let mut next_cleanup: Option<Instant> = None;
         loop {
-            match self
-                .receiver
-                .recv_timeout(next_cleanup.saturating_duration_since(Instant::now()))
-            {
+            match self.receiver.recv_timeout(
+                next_cleanup
+                    .map(|next_cleanup| next_cleanup.saturating_duration_since(Instant::now()))
+                    .unwrap_or(Duration::MAX),
+            ) {
                 Ok(config) => self.config = config,
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {
-                    next_cleanup = next_cleanup.add(self.config.interval);
+                    next_cleanup = next_cleanup
+                        .unwrap_or_else(Instant::now)
+                        .checked_add(self.config.interval);
                     self.maintenance();
                 }
             }
@@ -582,15 +585,20 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
     if let Some(config) = config.background_config.clone() {
         let mut lock = stealer.background_sender.lock().unwrap();
 
-        match &*lock {
-            Some((_, sender)) => sender.send(config).expect("Receiver exists"),
-            None => {
-                let (sender, receiver) = std::sync::mpsc::channel();
-                let mut worker = BackgroundWorker::new(receiver);
-                let join_handle = spawn(move || worker.run());
-                sender.send(config).expect("Receiver exists");
-                *lock = Some((join_handle, sender));
+        let config = if let Some((_, sender)) = &*lock {
+            match sender.send(config) {
+                Ok(()) => None,
+                Err(err) => Some(err.0),
             }
+        } else {
+            Some(config)
+        };
+        if let Some(config) = config {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let mut worker = BackgroundWorker::new(receiver);
+            let join_handle = spawn(move || worker.run());
+            sender.send(config).expect("Receiver exists");
+            *lock = Some((join_handle, sender));
         }
     }
 }
@@ -1051,16 +1059,18 @@ mod test {
             move || {
                 let mut i = 0;
                 let until = &*until;
+                let batch = 64;
+                let mut buffer = Vec::with_capacity(batch);
                 while until.load(Ordering::Relaxed) {
                     i += 64;
-                    let _ = (0..64)
+                    buffer.extend((0..batch)
                         .map(|_| {
                             let mut r: Region<u8> = std::hint::black_box(Region::new_auto(2 << 20));
                             // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
                             r.as_mut().push(1);
                             r
-                        })
-                        .collect::<Vec<_>>();
+                        }));
+                    buffer.clear();
                 }
                 println!("repetitions vec: {i}");
             }
