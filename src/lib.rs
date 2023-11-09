@@ -21,12 +21,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::{take, ManuallyDrop};
-use std::ops::{Add, Deref, DerefMut, Range};
+use std::ops::{Deref, DerefMut, Range};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{spawn, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
@@ -965,9 +965,10 @@ impl<T> Drop for MMapRegion<T> {
         // Forget reasoning: The vector points to the mapped region, which frees the
         // allocation. Don't drop elements, don't drop vec.
         if self.byte_size > 0 {
-            let ptr = NonNull::new(self.inner.as_mut_ptr().cast::<u8>()).expect("Inner is allocated");
+            let ptr =
+                NonNull::new(self.inner.as_mut_ptr().cast::<u8>()).expect("Inner is allocated");
             let ptr = NonNull::slice_from_raw_parts(ptr, self.byte_size);
-            with_stealer(|s| s.push(Mem{ptr}));
+            with_stealer(|s| s.push(Mem { ptr }));
         }
     }
 }
@@ -1063,13 +1064,12 @@ mod test {
                 let mut buffer = Vec::with_capacity(batch);
                 while until.load(Ordering::Relaxed) {
                     i += 64;
-                    buffer.extend((0..batch)
-                        .map(|_| {
-                            let mut r: Region<u8> = std::hint::black_box(Region::new_auto(2 << 20));
-                            // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
-                            r.as_mut().push(1);
-                            r
-                        }));
+                    buffer.extend((0..batch).map(|_| {
+                        let mut r: Region<u8> = std::hint::black_box(Region::new_auto(2 << 20));
+                        // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
+                        r.as_mut().push(1);
+                        r
+                    }));
                     buffer.clear();
                 }
                 println!("repetitions vec: {i}");
