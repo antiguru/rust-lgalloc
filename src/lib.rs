@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::{take, ManuallyDrop};
-use std::ops::{Add, Deref, DerefMut, Range};
+use std::ops::{Deref, DerefMut, Range};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -527,16 +527,19 @@ impl BackgroundWorker {
     }
 
     fn run(&mut self) {
-        let mut next_cleanup = Instant::now();
+        let mut next_cleanup: Option<Instant> = None;
         loop {
-            match self
-                .receiver
-                .recv_timeout(next_cleanup.saturating_duration_since(Instant::now()))
-            {
+            match self.receiver.recv_timeout(
+                next_cleanup
+                    .map(|next_cleanup| next_cleanup.saturating_duration_since(Instant::now()))
+                    .unwrap_or(Duration::MAX),
+            ) {
                 Ok(config) => self.config = config,
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {
-                    next_cleanup = next_cleanup.add(self.config.interval);
+                    next_cleanup = next_cleanup
+                        .unwrap_or_else(Instant::now)
+                        .checked_add(self.config.interval);
                     self.maintenance();
                 }
             }
@@ -589,15 +592,20 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
     if let Some(config) = config.background_config.clone() {
         let mut lock = stealer.background_sender.lock().unwrap();
 
-        match &*lock {
-            Some((_, sender)) => sender.send(config).expect("Receiver exists"),
-            None => {
-                let (sender, receiver) = std::sync::mpsc::channel();
-                let mut worker = BackgroundWorker::new(receiver);
-                let join_handle = spawn(move || worker.run());
-                sender.send(config).expect("Receiver exists");
-                *lock = Some((join_handle, sender));
+        let config = if let Some((_, sender)) = &*lock {
+            match sender.send(config) {
+                Ok(()) => None,
+                Err(err) => Some(err.0),
             }
+        } else {
+            Some(config)
+        };
+        if let Some(config) = config {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let mut worker = BackgroundWorker::new(receiver);
+            let join_handle = spawn(move || worker.run());
+            sender.send(config).expect("Receiver exists");
+            *lock = Some((join_handle, sender));
         }
     }
 }
