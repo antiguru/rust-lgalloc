@@ -72,14 +72,6 @@ impl Mem {
     }
 }
 
-impl From<&mut [u8]> for Mem {
-    fn from(value: &mut [u8]) -> Self {
-        Self {
-            ptr: NonNull::new(value).expect("Mapped memory ptr not null"),
-        }
-    }
-}
-
 /// The number of allocations to retain locally, per thread and size class.
 const LOCAL_BUFFER: usize = 32;
 
@@ -430,12 +422,13 @@ impl LocalSizeClass {
 
         let mut mmap = Self::init_file(byte_len)?;
         let mut chunks = mmap.as_mut().chunks_mut(self.size_class.byte_size());
-        let mem = chunks
-            .next()
-            .expect("At least once chunk allocated.")
-            .into();
+        let ptr = NonNull::new(chunks.next().expect("At least once chunk allocated."))
+            .expect("Mapped memory ptr not null");
+        let mem = Mem { ptr };
         for slice in chunks {
-            self.size_class_state.injector.push(slice.into());
+            self.size_class_state.injector.push(Mem {
+                ptr: NonNull::new(slice).expect("Mapped memory ptr not null"),
+            });
         }
         stash.push(ManuallyDrop::new(mmap));
         Ok(mem)
