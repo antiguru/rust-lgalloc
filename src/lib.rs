@@ -1055,16 +1055,17 @@ mod test {
             move || {
                 let mut i = 0;
                 let until = &*until;
+                let batch = 64;
+                let mut buffer = Vec::with_capacity(batch);
                 while until.load(Ordering::Relaxed) {
                     i += 64;
-                    let _ = (0..64)
-                        .map(|_| {
-                            let mut r: Region<u8> = std::hint::black_box(Region::new_auto(2 << 20));
-                            // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
-                            r.as_mut().push(1);
-                            r
-                        })
-                        .collect::<Vec<_>>();
+                    buffer.extend((0..batch).map(|_| {
+                        let mut r: Region<u8> = std::hint::black_box(Region::new_auto(2 << 20));
+                        // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
+                        r.as_mut().push(1);
+                        r
+                    }));
+                    buffer.clear();
                 }
                 println!("repetitions vec: {i}");
             }
