@@ -8,7 +8,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - run: rustup update 1.72 --no-self-update && rustup default 1.72
-    - run: cargo build
-    - run: cargo test
+    - run: cargo build --all-targets
+    - run: cargo test --all-targets
     - run: rustup component add rustfmt
     - run: cargo fmt --check
