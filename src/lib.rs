@@ -19,6 +19,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::mem::{take, ManuallyDrop};
 use std::ops::{Add, Deref, DerefMut, Range};
@@ -458,7 +459,7 @@ impl LocalSizeClass {
             )));
         };
         let file = tempfile::tempfile_in(path)?;
-        trace!(byte_len=byte_len, file=?file, "Allocated file")
+        trace!(byte_len=byte_len, file=?file, "Allocated file");
         // SAFETY: Calling ftruncate on the file, which we just created.
         unsafe {
             let ret = libc::ftruncate(
@@ -466,11 +467,14 @@ impl LocalSizeClass {
                 libc::off_t::try_from(byte_len).expect("Must fit"),
             );
             if ret != 0 {
-                return Err(std::io::Error::last_os_error().into());
+                let err = std::io::Error::last_os_error();
+                warn!(err=?err, ret=ret, "ftruncate failed");
+                return Err(err.into());
             }
         }
         // SAFETY: We only map `file` once, and never share it with other processes.
         let mmap = unsafe { memmap2::MmapOptions::new().populate().map_mut(&file)? };
+        trace!(ptr=?mmap.as_ptr(), len=mmap.len(), "Mapped file");
         assert_eq!(mmap.len(), byte_len);
         Ok(mmap)
     }
@@ -518,6 +522,15 @@ struct BackgroundWorker {
     worker: Worker<Mem>,
 }
 
+impl Debug for BackgroundWorker {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundWorker")
+            .field("config", &self.config)
+            .field("worker", &self.worker)
+            .finish_non_exhaustive()
+    }
+}
+
 impl BackgroundWorker {
     fn new(receiver: Receiver<BackgroundWorkerConfig>) -> Self {
         let config = BackgroundWorkerConfig {
@@ -551,12 +564,14 @@ impl BackgroundWorker {
         }
     }
 
+    #[tracing::instrument]
     fn maintenance(&self) {
         for size_class in &self.global_stealer.size_classes {
             let _ = self.clear(size_class, &self.worker);
         }
     }
 
+    #[tracing::instrument]
     fn clear(&self, size_class: &SizeClassState, worker: &Worker<Mem>) -> usize {
         let _ = size_class
             .injector
@@ -611,7 +626,7 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
 }
 
 /// Configuration for lgalloc's background worker.
-#[derive(Default, Clone, Eq, PartialEq)]
+#[derive(Default, Debug, Clone, Eq, PartialEq)]
 pub struct BackgroundWorkerConfig {
     /// How frequently it should tick
     pub interval: Duration,
@@ -983,6 +998,7 @@ mod test {
     use std::time::Duration;
 
     use serial_test::serial;
+    use tracing::info;
 
     use crate::{AllocError, BackgroundWorkerConfig, LgAlloc, Region};
 
@@ -1017,7 +1033,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     #[serial]
     fn test_3() -> Result<(), AllocError> {
         initialize();
@@ -1034,7 +1050,7 @@ mod test {
                     // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
                     r.as_mut().push(1);
                 }
-                println!("repetitions: {i}");
+                info!(repetitions = i, "test done");
             }
         };
         let handles = [
@@ -1052,7 +1068,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     #[serial]
     fn test_4() -> Result<(), AllocError> {
         initialize();
