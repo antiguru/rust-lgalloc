@@ -462,7 +462,7 @@ impl LocalSizeClass {
             }
         }
         // SAFETY: We only map `file` once, and never share it with other processes.
-        let mmap = unsafe { memmap2::MmapOptions::new().populate().map_mut(&file)? };
+        let mmap = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
         assert_eq!(mmap.len(), byte_len);
         Ok(mmap)
     }
