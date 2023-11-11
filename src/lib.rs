@@ -19,6 +19,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::mem::{take, ManuallyDrop};
 use std::ops::{Deref, DerefMut, Range};
@@ -34,8 +35,10 @@ use std::time::{Duration, Instant};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use memmap2::MmapMut;
 use thiserror::Error;
+use tracing::{trace, warn};
 
 /// Pointer to a region of memory.
+#[derive(Debug)]
 struct Mem {
     /// The actual pointer.
     ptr: NonNull<[u8]>,
@@ -65,7 +68,7 @@ impl Mem {
         };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            eprintln!("madvise failed: {ret} {err:?}",);
+            warn!(err=?err, ret=ret, "madvise failed",);
             return Err(err);
         }
         Ok(())
@@ -128,7 +131,7 @@ impl AllocError {
 }
 
 /// Abstraction over size classes.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct SizeClass(usize);
 
 impl SizeClass {
@@ -184,13 +187,13 @@ struct AllocStats {
 }
 
 /// Handle to the shared global state.
-static INJECTOR: OnceLock<GlobalStealer> = OnceLock::new();
+static INJECTOR: OnceLock<GlobalState> = OnceLock::new();
 
 /// Enabled switch to turn on or off lgalloc. Off by default.
 static LGALLOC_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Type maintaining the global state for each size class.
-struct GlobalStealer {
+struct GlobalState {
     /// State for each size class. An entry at position `x` handle size class `x`, which is areas
     /// of size `1<<x`.
     size_classes: Vec<SizeClassState>,
@@ -201,7 +204,7 @@ struct GlobalStealer {
 }
 
 /// Per-size-class state
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct SizeClassState {
     /// Handle to memory-mapped regions.
     ///
@@ -219,7 +222,7 @@ struct SizeClassState {
     alloc_stats: AllocStats,
 }
 
-impl GlobalStealer {
+impl GlobalState {
     /// Obtain the shared global state.
     fn get_static() -> &'static Self {
         INJECTOR.get_or_init(Self::new)
@@ -245,12 +248,13 @@ impl GlobalStealer {
     }
 }
 
-impl Drop for GlobalStealer {
+impl Drop for GlobalState {
     fn drop(&mut self) {
         take(&mut self.size_classes);
     }
 }
 
+#[derive(Debug)]
 struct PerThreadState<T> {
     stealer: Stealer<T>,
     alloc_stats: Arc<AllocStats>,
@@ -304,6 +308,7 @@ thread_local! {
 ///
 /// We store parts of areas in this struct. Leaking this struct leaks the areas, which is safe
 /// because we will never try to access or reclaim them.
+#[derive(Debug)]
 struct LocalSizeClass {
     /// Local memory queue.
     worker: Worker<Mem>,
@@ -322,7 +327,7 @@ impl LocalSizeClass {
     /// Construct a new local size class state. Registers the worker with the global state.
     fn new(size_class: SizeClass, thread_id: ThreadId) -> Self {
         let worker = Worker::new_lifo();
-        let stealer = GlobalStealer::get_static();
+        let stealer = GlobalState::get_static();
         let size_class_state = stealer.get_size_class(size_class);
 
         let stats = Arc::new(AllocStats::default());
@@ -419,8 +424,10 @@ impl LocalSizeClass {
     /// Refill the memory pool, and get one area.
     ///
     /// Returns an error if the memory pool cannot be refilled.
+    #[tracing::instrument]
     fn try_refill_and_get(&self) -> Result<Mem, AllocError> {
         self.stats.refill.fetch_add(1, Ordering::Relaxed);
+        // Obtain a lock on the areas to ensure not two threads allocate regions in parallel.
         let mut stash = self.size_class_state.areas.write().unwrap();
 
         let byte_len = stash.iter().last().map_or_else(
@@ -428,7 +435,7 @@ impl LocalSizeClass {
             |mmap| mmap.len() * 2,
         );
 
-        let mut mmap = Self::init_file(byte_len)?;
+        let mut mmap = ManuallyDrop::new(Self::init_file(byte_len)?);
         let mut chunks = mmap.as_mut().chunks_mut(self.size_class.byte_size());
         let mem = chunks
             .next()
@@ -437,20 +444,22 @@ impl LocalSizeClass {
         for slice in chunks {
             self.size_class_state.injector.push(slice.into());
         }
-        stash.push(ManuallyDrop::new(mmap));
+        stash.push(mmap);
         Ok(mem)
     }
 
     /// Allocate and map a file of size `byte_len`. Returns an handle, or error if the allocation
     /// fails.
+    #[tracing::instrument]
     fn init_file(byte_len: usize) -> Result<MmapMut, AllocError> {
-        let path = GlobalStealer::get_static().path.read().unwrap().clone();
+        let path = GlobalState::get_static().path.read().unwrap().clone();
         let Some(path) = path else {
             return Err(AllocError::Io(std::io::Error::from(
                 std::io::ErrorKind::NotFound,
             )));
         };
         let file = tempfile::tempfile_in(path)?;
+        trace!(byte_len=byte_len, file=?file, "Allocated file");
         // SAFETY: Calling ftruncate on the file, which we just created.
         unsafe {
             let ret = libc::ftruncate(
@@ -458,11 +467,14 @@ impl LocalSizeClass {
                 libc::off_t::try_from(byte_len).expect("Must fit"),
             );
             if ret != 0 {
-                return Err(std::io::Error::last_os_error().into());
+                let err = std::io::Error::last_os_error();
+                warn!(err=?err, ret=ret, "ftruncate failed");
+                return Err(err.into());
             }
         }
         // SAFETY: We only map `file` once, and never share it with other processes.
         let mmap = unsafe { memmap2::MmapOptions::new().populate().map_mut(&file)? };
+        trace!(ptr=?mmap.as_ptr(), len=mmap.len(), "Mapped file");
         assert_eq!(mmap.len(), byte_len);
         Ok(mmap)
     }
@@ -506,8 +518,17 @@ fn with_stealer<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
 struct BackgroundWorker {
     config: BackgroundWorkerConfig,
     receiver: Receiver<BackgroundWorkerConfig>,
-    global_stealer: &'static GlobalStealer,
+    global_stealer: &'static GlobalState,
     worker: Worker<Mem>,
+}
+
+impl Debug for BackgroundWorker {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundWorker")
+            .field("config", &self.config)
+            .field("worker", &self.worker)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BackgroundWorker {
@@ -516,7 +537,7 @@ impl BackgroundWorker {
             interval: Duration::MAX,
             ..Default::default()
         };
-        let global_stealer = GlobalStealer::get_static();
+        let global_stealer = GlobalState::get_static();
         let worker = Worker::new_fifo();
         Self {
             config,
@@ -546,12 +567,14 @@ impl BackgroundWorker {
         }
     }
 
+    #[tracing::instrument]
     fn maintenance(&self) {
         for size_class in &self.global_stealer.size_classes {
             let _ = self.clear(size_class, &self.worker);
         }
     }
 
+    #[tracing::instrument]
     fn clear(&self, size_class: &SizeClassState, worker: &Worker<Mem>) -> usize {
         let _ = size_class
             .injector
@@ -579,7 +602,7 @@ impl BackgroundWorker {
 /// Updating the background thread configuration eventually applies the new configuration on the
 /// running thread, or starts the background worker.
 pub fn lgalloc_set_config(config: &LgAlloc) {
-    let stealer = GlobalStealer::get_static();
+    let stealer = GlobalState::get_static();
 
     if let Some(enabled) = &config.enabled {
         LGALLOC_ENABLED.store(*enabled, Ordering::Relaxed);
@@ -611,7 +634,7 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
 }
 
 /// Configuration for lgalloc's background worker.
-#[derive(Default, Clone, Eq, PartialEq)]
+#[derive(Default, Debug, Clone, Eq, PartialEq)]
 pub struct BackgroundWorkerConfig {
     /// How frequently it should tick
     pub interval: Duration,
@@ -660,7 +683,7 @@ impl LgAlloc {
 pub fn lgalloc_stats(stats: &mut LgAllocStats) {
     stats.size_class.clear();
 
-    let global = GlobalStealer::get_static();
+    let global = GlobalState::get_static();
 
     for (index, size_class_state) in global.size_classes.iter().enumerate() {
         let size_class = SizeClass::from_index(index);
@@ -856,7 +879,7 @@ impl<T> Region<T> {
         } else {
             Region::new_mmap(capacity).unwrap_or_else(|err| {
                 if !err.is_disabled() {
-                    eprintln!("Mmap pool exhausted, falling back to heap: {err}");
+                    warn!(err=?err, "Mmap pool exhausted, falling back to heap");
                 }
                 Region::new_heap(capacity)
             })
@@ -983,6 +1006,7 @@ mod test {
     use std::time::Duration;
 
     use serial_test::serial;
+    use tracing::info;
 
     use crate::{AllocError, BackgroundWorkerConfig, LgAlloc, Region};
 
@@ -1017,7 +1041,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     #[serial]
     fn test_3() -> Result<(), AllocError> {
         initialize();
@@ -1034,7 +1058,7 @@ mod test {
                     // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
                     r.as_mut().push(1);
                 }
-                println!("repetitions: {i}");
+                info!(repetitions = i, "test done");
             }
         };
         let handles = [
@@ -1052,7 +1076,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     #[serial]
     fn test_4() -> Result<(), AllocError> {
         initialize();
