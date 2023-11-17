@@ -72,14 +72,6 @@ impl Mem {
     }
 }
 
-impl From<&mut [u8]> for Mem {
-    fn from(value: &mut [u8]) -> Self {
-        Self {
-            ptr: NonNull::new(value).expect("Mapped memory ptr not null"),
-        }
-    }
-}
-
 /// The number of allocations to retain locally, per thread and size class.
 const LOCAL_BUFFER: usize = 32;
 
@@ -430,12 +422,13 @@ impl LocalSizeClass {
 
         let mut mmap = Self::init_file(byte_len)?;
         let mut chunks = mmap.as_mut().chunks_mut(self.size_class.byte_size());
-        let mem = chunks
-            .next()
-            .expect("At least once chunk allocated.")
-            .into();
+        let ptr = NonNull::new(chunks.next().expect("At least once chunk allocated."))
+            .expect("Mapped memory ptr not null");
+        let mem = Mem { ptr };
         for slice in chunks {
-            self.size_class_state.injector.push(slice.into());
+            self.size_class_state.injector.push(Mem {
+                ptr: NonNull::new(slice).expect("Mapped memory ptr not null"),
+            });
         }
         stash.push(ManuallyDrop::new(mmap));
         Ok(mem)
@@ -759,8 +752,9 @@ pub enum Region<T> {
 pub struct MMapRegion<T> {
     /// Vector-representation of the underlying memory. Must not be dropped.
     inner: ManuallyDrop<Vec<T>>,
-    /// The actual memory, so we can recycle it. Option to allow moving.
-    mem: Option<Mem>,
+    /// The size of the underlying region, which can be larger than what `inner`
+    /// allows us to access.
+    byte_size: usize,
 }
 
 impl<T> MMapRegion<T> {
@@ -832,7 +826,7 @@ impl<T> Region<T> {
             debug_assert!(std::mem::size_of::<T>() * inner.len() <= mem.len());
             Ok(Region::MMap(MMapRegion {
                 inner,
-                mem: Some(mem),
+                byte_size: mem.len(),
             }))
         })
     }
@@ -970,9 +964,11 @@ impl<T> Drop for Region<T> {
 
 impl<T> Drop for MMapRegion<T> {
     fn drop(&mut self) {
-        // Forget reasoning: The vector points to the mapped region, which frees the
-        // allocation. Don't drop elements, don't drop vec.
-        with_stealer(|s| s.push(take(&mut self.mem).unwrap()));
+        // We're deliberately not dropping `self.inner` here because we return the region
+        // manually.
+        let ptr = NonNull::new(self.inner.as_mut_ptr().cast::<u8>()).expect("Inner is allocated");
+        let ptr = NonNull::slice_from_raw_parts(ptr, self.byte_size);
+        with_stealer(|s| s.push(Mem { ptr }));
     }
 }
 
