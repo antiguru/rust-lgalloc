@@ -50,7 +50,7 @@ impl Mem {
     }
 
     /// Indicate that the memory is not in use and that the OS can recycle it.
-    fn clear(&mut self) -> std::io::Result<()> {
+    fn clear(&self) -> std::io::Result<()> {
         // SAFETY: Calling into `madvise`:
         // * The ptr is page-aligned by construction.
         // * The ptr + length is page-aligned by construction (not required but surprising otherwise)
@@ -94,7 +94,7 @@ pub const VALID_SIZE_CLASS: Range<usize> = 16..33;
 // on file systems that supports FALLOC_FL_PUNCH_HOLE. We should check
 // the return value and retry EOPNOTSUPP with MADV_DONTNEED.
 #[cfg(target_os = "linux")]
-const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_REMOVE;
+const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
 
 #[cfg(not(target_os = "linux"))]
 const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
@@ -186,8 +186,23 @@ struct AllocStats {
 /// Handle to the shared global state.
 static INJECTOR: OnceLock<GlobalStealer> = OnceLock::new();
 
-/// Enabled switch to turn on or off lgalloc. Off by default.
-static LGALLOC_ENABLED: AtomicBool = AtomicBool::new(false);
+struct Settings {
+    /// Enabled switch to turn on or off lgalloc. Off by default.
+    enabled: AtomicBool,
+    eager_clear: AtomicBool,
+}
+
+impl Settings {
+    const fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            eager_clear: AtomicBool::new(true),
+        }
+    }
+}
+
+
+static LGALLOC_SETTINGS: Settings = Settings::new();
 
 /// Type maintaining the global state for each size class.
 struct GlobalStealer {
@@ -280,7 +295,7 @@ impl ThreadLocalStealer {
     /// Returns [`AllocError::Disabled`] if lgalloc is not enabled. Returns other error types
     /// if out of memory, or an internal operation fails.
     fn get(&mut self, size_class: SizeClass) -> Result<Mem, AllocError> {
-        if !LGALLOC_ENABLED.load(Ordering::Relaxed) {
+        if !LGALLOC_SETTINGS.enabled.load(Ordering::Relaxed) {
             return Err(AllocError::Disabled);
         }
         self.size_classes[size_class.index()].get_with_refill()
@@ -409,8 +424,14 @@ impl LocalSizeClass {
     fn push(&self, mem: Mem) {
         debug_assert_eq!(mem.len(), self.size_class.byte_size());
         self.stats.deallocations.fetch_add(1, Ordering::Relaxed);
+        let injector = if LGALLOC_SETTINGS.eager_clear.load(Ordering::Relaxed) {
+            mem.clear().expect("Clearing successful");
+            &self.size_class_state.clean_injector
+        } else {
+            &self.size_class_state.injector
+        };
         if self.worker.len() >= LOCAL_BUFFER {
-            self.size_class_state.injector.push(mem);
+            injector.push(mem);
         } else {
             self.worker.push(mem);
         }
@@ -548,23 +569,18 @@ impl BackgroundWorker {
 
     fn maintenance(&self) {
         for size_class in &self.global_stealer.size_classes {
-            let _ = self.clear(size_class, &self.worker);
+            self.clear(size_class, &self.worker);
         }
     }
 
-    fn clear(&self, size_class: &SizeClassState, worker: &Worker<Mem>) -> usize {
+    fn clear(&self, size_class: &SizeClassState, worker: &Worker<Mem>) {
         let _ = size_class
             .injector
             .steal_batch_with_limit(worker, self.config.batch);
-        let mut count = 0;
-        while let Some(mut mem) = worker.pop() {
-            match mem.clear() {
-                Ok(()) => count += 1,
-                Err(e) => panic!("Syscall failed: {e:?}"),
-            }
+        while let Some(mem) = worker.pop() {
+            mem.clear().expect("Clearing successful");
             size_class.clean_injector.push(mem);
         }
-        count
     }
 }
 
@@ -581,8 +597,12 @@ impl BackgroundWorker {
 pub fn lgalloc_set_config(config: &LgAlloc) {
     let stealer = GlobalStealer::get_static();
 
-    if let Some(enabled) = &config.enabled {
-        LGALLOC_ENABLED.store(*enabled, Ordering::Relaxed);
+    if let Some(enabled) = config.enabled {
+        LGALLOC_SETTINGS.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    if let Some(enabled) = config.eager_clear {
+        LGALLOC_SETTINGS.eager_clear.store(enabled, Ordering::Relaxed);
     }
 
     if let Some(path) = &config.path {
@@ -628,6 +648,9 @@ pub struct LgAlloc {
     pub path: Option<PathBuf>,
     /// Configuration of the background worker.
     pub background_config: Option<BackgroundWorkerConfig>,
+    /// Enable or disable eager clearing. When enabled, all memory is cleared immediately when
+    /// returned.
+    pub eager_clear: Option<bool>,
 }
 
 impl LgAlloc {
@@ -650,6 +673,11 @@ impl LgAlloc {
     /// Set the area file path.
     pub fn with_path(&mut self, path: PathBuf) -> &mut Self {
         self.path = Some(path);
+        self
+    }
+
+    pub fn enable_eager_clear(&mut self) -> &mut Self {
+        self.eager_clear = Some(true);
         self
     }
 }
@@ -1103,6 +1131,7 @@ mod test {
             enabled: Some(true),
             path: Some(std::env::temp_dir()),
             background_config: None,
+            eager_clear: None,
         });
         let r = Region::<i32>::new_mmap(10000).unwrap();
 
