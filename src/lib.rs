@@ -49,26 +49,42 @@ impl Mem {
         self.ptr.len()
     }
 
-    /// Indicate that the memory is not in use and that the OS can recycle it.
-    fn clear(&self) -> std::io::Result<()> {
+    /// Internal helper to call [`libc::madvise`] in the region of memory we represent.
+    fn madvise(&self, advice: libc::c_int) -> std::io::Result<()> {
         // SAFETY: Calling into `madvise`:
         // * The ptr is page-aligned by construction.
         // * The ptr + length is page-aligned by construction (not required but surprising otherwise)
-        // * Mapped shared and writable (for MADV_REMOVE),
+        // * Mapped shared and writable (for MADV_REMOVE/MADV_DONTNEED),
         // * Pages not locked.
-        let ret = unsafe {
-            libc::madvise(
-                self.ptr.as_ptr().cast(),
-                self.ptr.len(),
-                MADV_DONTNEED_STRATEGY,
-            )
-        };
+        let ret = unsafe { libc::madvise(self.ptr.as_ptr().cast(), self.ptr.len(), advice) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             eprintln!("madvise failed: {ret} {err:?}",);
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Indicate that the memory is not in use and that the OS can recycle it.
+    fn clear(&self) -> std::io::Result<()> {
+        self.madvise(libc::MADV_DONTNEED)
+    }
+
+    /// Indicate that the memory is not in use and that the OS can recycle it.
+    ///
+    /// On supported operating systems, this removes the underlying storage, otherwise equal to [`Self::clear`]
+    fn remove(&self) -> std::io::Result<()> {
+        // Strategy to indicate that the OS can reclaim pages
+        // TODO: On Linux, we want to use MADV_REMOVE, but that's only supported
+        // on file systems that supports FALLOC_FL_PUNCH_HOLE. We should check
+        // the return value and retry EOPNOTSUPP with MADV_DONTNEED.
+        #[cfg(target_os = "linux")]
+        const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_REMOVE;
+
+        #[cfg(not(target_os = "linux"))]
+        const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
+
+        self.madvise(MADV_DONTNEED_STRATEGY)
     }
 }
 
@@ -80,24 +96,14 @@ impl From<&mut [u8]> for Mem {
     }
 }
 
-/// The number of allocations to retain locally, per thread and size class.
-const LOCAL_BUFFER: usize = 32;
+/// The total size in bytes in allocations to retain locally, per thread and size class.
+const LOCAL_BUFFER: usize = 32 << 20;
 
 // Initial file size
 const INITIAL_SIZE: usize = 32 << 20;
 
 /// Range of valid size classes.
 pub const VALID_SIZE_CLASS: Range<usize> = 16..33;
-
-/// Strategy to indicate that the OS can reclaim pages
-// TODO: On Linux, we want to use MADV_REMOVE, but that's only supported
-// on file systems that supports FALLOC_FL_PUNCH_HOLE. We should check
-// the return value and retry EOPNOTSUPP with MADV_DONTNEED.
-#[cfg(target_os = "linux")]
-const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
-
-#[cfg(not(target_os = "linux"))]
-const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
 
 type PhantomUnsyncUnsend<T> = PhantomData<*mut T>;
 
@@ -189,6 +195,7 @@ static INJECTOR: OnceLock<GlobalStealer> = OnceLock::new();
 struct Settings {
     /// Enabled switch to turn on or off lgalloc. Off by default.
     enabled: AtomicBool,
+    /// Should we return memory to the OS immediately when returning memory?
     eager_clear: AtomicBool,
 }
 
@@ -200,7 +207,6 @@ impl Settings {
         }
     }
 }
-
 
 static LGALLOC_SETTINGS: Settings = Settings::new();
 
@@ -376,13 +382,15 @@ impl LocalSizeClass {
                     // 2. Memory from the global cleaned state,
                     // 3. Memory from other threads.
 
+                    // We want to allocate at least one item.
+                    let limit = 1.max(LOCAL_BUFFER / self.size_class.byte_size() / 2);
                     self.size_class_state
                         .injector
-                        .steal_batch_with_limit_and_pop(&self.worker, LOCAL_BUFFER / 2)
+                        .steal_batch_with_limit_and_pop(&self.worker, limit)
                         .or_else(|| {
                             self.size_class_state
                                 .clean_injector
-                                .steal_batch_with_limit_and_pop(&self.worker, LOCAL_BUFFER / 2)
+                                .steal_batch_with_limit_and_pop(&self.worker, limit)
                         })
                         .or_else(|| {
                             self.size_class_state
@@ -430,7 +438,7 @@ impl LocalSizeClass {
         } else {
             &self.size_class_state.injector
         };
-        if self.worker.len() >= LOCAL_BUFFER {
+        if self.worker.len() >= LOCAL_BUFFER / self.size_class.byte_size() {
             injector.push(mem);
         } else {
             self.worker.push(mem);
@@ -569,16 +577,16 @@ impl BackgroundWorker {
 
     fn maintenance(&self) {
         for size_class in &self.global_stealer.size_classes {
-            self.clear(size_class, &self.worker);
+            self.remove(size_class, &self.worker);
         }
     }
 
-    fn clear(&self, size_class: &SizeClassState, worker: &Worker<Mem>) {
+    fn remove(&self, size_class: &SizeClassState, worker: &Worker<Mem>) {
         let _ = size_class
             .injector
             .steal_batch_with_limit(worker, self.config.batch);
         while let Some(mem) = worker.pop() {
-            mem.clear().expect("Clearing successful");
+            mem.remove().expect("Removing successful");
             size_class.clean_injector.push(mem);
         }
     }
@@ -602,7 +610,9 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
     }
 
     if let Some(enabled) = config.eager_clear {
-        LGALLOC_SETTINGS.eager_clear.store(enabled, Ordering::Relaxed);
+        LGALLOC_SETTINGS
+            .eager_clear
+            .store(enabled, Ordering::Relaxed);
     }
 
     if let Some(path) = &config.path {
