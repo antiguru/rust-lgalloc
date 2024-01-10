@@ -1,6 +1,6 @@
 [package]
 name = "lgalloc"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 authors = ["Moritz Hoffmann <antiguru@gmail.com>"]
 description = "Large object allocator"
