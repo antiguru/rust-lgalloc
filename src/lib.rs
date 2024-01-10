@@ -80,8 +80,8 @@ impl From<&mut [u8]> for Mem {
     }
 }
 
-/// The number of allocations to retain locally, per thread and size class.
-const LOCAL_BUFFER: usize = 32;
+/// The size of allocations to retain locally, per thread and size class.
+const LOCAL_BUFFER_BYTES: usize = 32 << 20;
 
 // Initial file size
 const INITIAL_SIZE: usize = 32 << 20;
@@ -360,14 +360,15 @@ impl LocalSizeClass {
                     // 1. Memory from the global state,
                     // 2. Memory from the global cleaned state,
                     // 3. Memory from other threads.
+                    let limit = 1.max(LOCAL_BUFFER_BYTES / self.size_class.byte_size() / 2);
 
                     self.size_class_state
                         .injector
-                        .steal_batch_with_limit_and_pop(&self.worker, LOCAL_BUFFER / 2)
+                        .steal_batch_with_limit_and_pop(&self.worker, limit)
                         .or_else(|| {
                             self.size_class_state
                                 .clean_injector
-                                .steal_batch_with_limit_and_pop(&self.worker, LOCAL_BUFFER / 2)
+                                .steal_batch_with_limit_and_pop(&self.worker, limit)
                         })
                         .or_else(|| {
                             self.size_class_state
@@ -409,7 +410,7 @@ impl LocalSizeClass {
     fn push(&self, mem: Mem) {
         debug_assert_eq!(mem.len(), self.size_class.byte_size());
         self.stats.deallocations.fetch_add(1, Ordering::Relaxed);
-        if self.worker.len() >= LOCAL_BUFFER {
+        if self.worker.len() >= LOCAL_BUFFER_BYTES / self.size_class.byte_size() {
             self.size_class_state.injector.push(mem);
         } else {
             self.worker.push(mem);
