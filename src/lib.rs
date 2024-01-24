@@ -35,18 +35,43 @@ use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use memmap2::MmapMut;
 use thiserror::Error;
 
-/// Pointer to a region of memory.
-struct Mem {
+/// Handle to describe allocations.
+///
+/// Handles represent a leased allocation, which must be explicitly freed. Otherwise, the caller will permanently leak
+/// the associated memory.
+pub struct Handle {
     /// The actual pointer.
-    ptr: NonNull<[u8]>,
+    ptr: NonNull<u8>,
+    /// Length of the allocation.
+    len: usize,
 }
 
-unsafe impl Send for Mem {}
+unsafe impl Send for Handle {}
+unsafe impl Sync for Handle {}
 
-impl Mem {
+#[allow(clippy::len_without_is_empty)]
+impl Handle {
+    const NULL: Handle = Handle {
+        ptr: NonNull::dangling(),
+        len: 0,
+    };
+
+    fn new(region: &mut [u8]) -> Self {
+        Self {
+            // SAFETY: `region` known to point to valid memory.
+            ptr: unsafe { NonNull::new_unchecked(region.as_mut_ptr()) },
+            len: region.len(),
+        }
+    }
+
     /// Length of the memory area in bytes.
-    fn len(&self) -> usize {
-        self.ptr.len()
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Pointer to memory.
+    pub fn as_non_null(&self) -> NonNull<u8> {
+        self.ptr
     }
 
     /// Indicate that the memory is not in use and that the OS can recycle it.
@@ -56,27 +81,14 @@ impl Mem {
         // * The ptr + length is page-aligned by construction (not required but surprising otherwise)
         // * Mapped shared and writable (for MADV_REMOVE),
         // * Pages not locked.
-        let ret = unsafe {
-            libc::madvise(
-                self.ptr.as_ptr().cast(),
-                self.ptr.len(),
-                MADV_DONTNEED_STRATEGY,
-            )
-        };
+        let ptr = self.as_non_null().as_ptr().cast();
+        let ret = unsafe { libc::madvise(ptr, self.len, MADV_DONTNEED_STRATEGY) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             eprintln!("madvise failed: {ret} {err:?}",);
             return Err(err);
         }
         Ok(())
-    }
-}
-
-impl From<&mut [u8]> for Mem {
-    fn from(value: &mut [u8]) -> Self {
-        Self {
-            ptr: NonNull::new(value).expect("Mapped memory ptr not null"),
-        }
     }
 }
 
@@ -145,6 +157,7 @@ impl SizeClass {
         self.0 - VALID_SIZE_CLASS.start
     }
 
+    /// The size in bytes of this size class.
     const fn byte_size(&self) -> usize {
         1 << self.0
     }
@@ -153,6 +166,7 @@ impl SizeClass {
         Self(index + VALID_SIZE_CLASS.start)
     }
 
+    /// Obtain a size class from a size in bytes.
     fn from_byte_size(byte_size: usize) -> Result<Self, AllocError> {
         let class = byte_size.next_power_of_two().trailing_zeros() as usize;
         class.try_into()
@@ -208,13 +222,13 @@ struct SizeClassState {
     /// We must never dereference the memory-mapped regions stored here.
     areas: RwLock<Vec<ManuallyDrop<MmapMut>>>,
     /// Injector to distribute memory globally.
-    injector: Injector<Mem>,
+    injector: Injector<Handle>,
     /// Injector to distribute memory globally, freed memory.
-    clean_injector: Injector<Mem>,
+    clean_injector: Injector<Handle>,
     /// Slow-path lock to refill pool.
     lock: Mutex<()>,
     /// Thread stealers to allow all participating threads to steal memory.
-    stealers: RwLock<HashMap<ThreadId, PerThreadState<Mem>>>,
+    stealers: RwLock<HashMap<ThreadId, PerThreadState<Handle>>>,
     /// Summed stats for terminated threads.
     alloc_stats: AllocStats,
 }
@@ -257,7 +271,7 @@ struct PerThreadState<T> {
 }
 
 /// Per-thread and state, sharded by size class.
-struct ThreadLocalStealer {
+pub struct ThreadLocalStealer {
     /// Per-size-class state
     size_classes: Vec<LocalSizeClass>,
     _phantom: PhantomUnsyncUnsend<Self>,
@@ -279,7 +293,8 @@ impl ThreadLocalStealer {
     ///
     /// Returns [`AllocError::Disabled`] if lgalloc is not enabled. Returns other error types
     /// if out of memory, or an internal operation fails.
-    fn get(&mut self, size_class: SizeClass) -> Result<Mem, AllocError> {
+    #[inline]
+    fn alloc(&mut self, size_class: SizeClass) -> Result<Handle, AllocError> {
         if !LGALLOC_ENABLED.load(Ordering::Relaxed) {
             return Err(AllocError::Disabled);
         }
@@ -287,9 +302,10 @@ impl ThreadLocalStealer {
     }
 
     /// Return memory to the allocator. Must have been obtained through `get`.
-    fn push(&self, mem: Mem) {
+    #[inline]
+    fn free(&self, mem: &mut Handle) {
         let size_class = SizeClass::from_byte_size_unchecked(mem.len());
-
+        let mem = std::mem::replace(mem, Handle::NULL);
         self.size_classes[size_class.index()].push(mem);
     }
 }
@@ -306,7 +322,7 @@ thread_local! {
 /// because we will never try to access or reclaim them.
 struct LocalSizeClass {
     /// Local memory queue.
-    worker: Worker<Mem>,
+    worker: Worker<Handle>,
     /// Size class we're covering
     size_class: SizeClass,
     /// Handle to global size class state
@@ -351,7 +367,7 @@ impl LocalSizeClass {
     ///
     /// Returns [`AllcError::OutOfMemory`] if all pools are empty.
     #[inline(always)]
-    fn get(&self) -> Result<Mem, AllocError> {
+    fn get(&self) -> Result<Handle, AllocError> {
         self.worker
             .pop()
             .or_else(|| {
@@ -387,7 +403,7 @@ impl LocalSizeClass {
     }
 
     /// Like [`Self::get()`] but trying to refill the pool if it is empty.
-    fn get_with_refill(&self) -> Result<Mem, AllocError> {
+    fn get_with_refill(&self) -> Result<Handle, AllocError> {
         self.stats.allocations.fetch_add(1, Ordering::Relaxed);
         // Fast-path: Get non-blocking
         match self.get() {
@@ -407,7 +423,7 @@ impl LocalSizeClass {
     }
 
     /// Recycle memory. Stores it locally or forwards it to the global state.
-    fn push(&self, mem: Mem) {
+    fn push(&self, mem: Handle) {
         debug_assert_eq!(mem.len(), self.size_class.byte_size());
         self.stats.deallocations.fetch_add(1, Ordering::Relaxed);
         if self.worker.len() >= LOCAL_BUFFER_BYTES / self.size_class.byte_size() {
@@ -420,7 +436,7 @@ impl LocalSizeClass {
     /// Refill the memory pool, and get one area.
     ///
     /// Returns an error if the memory pool cannot be refilled.
-    fn try_refill_and_get(&self) -> Result<Mem, AllocError> {
+    fn try_refill_and_get(&self) -> Result<Handle, AllocError> {
         self.stats.refill.fetch_add(1, Ordering::Relaxed);
         let mut stash = self.size_class_state.areas.write().unwrap();
 
@@ -430,13 +446,10 @@ impl LocalSizeClass {
         );
 
         let mut mmap = Self::init_file(byte_len)?;
-        let mut chunks = mmap.as_mut().chunks_mut(self.size_class.byte_size());
-        let mem = chunks
-            .next()
-            .expect("At least once chunk allocated.")
-            .into();
+        let mut chunks = mmap.as_mut().chunks_exact_mut(self.size_class.byte_size());
+        let mem = Handle::new(chunks.next().expect("At least once chunk allocated."));
         for slice in chunks {
-            self.size_class_state.injector.push(slice.into());
+            self.size_class_state.injector.push(Handle::new(slice));
         }
         stash.push(ManuallyDrop::new(mmap));
         Ok(mem)
@@ -500,15 +513,49 @@ impl Drop for LocalSizeClass {
     }
 }
 
-fn with_stealer<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
+fn thread_context<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
     WORKER.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+/// Allocate a memory area suitable to hold `capacity` consecutive elements of `T`.
+///
+/// Returns a pointer, a capacity in `T`, and a handle if successful, and an error
+/// otherwise. The capacity can be larger than requested.
+///
+/// The memory must be freed using [`free`], otherwise the memory leaks. The memory can be freed on a different thread.
+pub fn allocate<T>(capacity: usize) -> Result<(NonNull<T>, usize, Handle), AllocError> {
+    // Round up to at least a page.
+    // TODO: This assumes 4k pages.
+    let byte_len = std::cmp::max(0x1000, std::mem::size_of::<T>() * capacity);
+    let size_class = SizeClass::from_byte_size(byte_len)?;
+
+    thread_context(|s| s.alloc(size_class)).and_then(|mut handle| {
+        debug_assert_eq!(handle.len(), size_class.byte_size());
+        let actual_capacity = handle.len() / std::mem::size_of::<T>();
+        let ptr: NonNull<T> = handle.as_non_null().cast();
+        // Memory region should be page-aligned, which we assume to be larger than any alignment
+        // we might encounter. If this is not the case, bail out.
+        if ptr.as_ptr().align_offset(std::mem::align_of::<T>()) != 0 {
+            thread_context(|s| s.free(&mut handle));
+            return Err(AllocError::UnalignedMemory);
+        }
+        Ok((ptr, actual_capacity, handle))
+    })
+}
+
+/// Free the memory referenced by `handle`, which has been obtained from [`allocate`].
+///
+/// This function cannot fail. The caller must not access the memory after freeing it. The caller is responsible
+/// for dropping/forgetting data.
+pub fn free(mut handle: Handle) {
+    thread_context(|s| s.free(&mut handle))
 }
 
 struct BackgroundWorker {
     config: BackgroundWorkerConfig,
     receiver: Receiver<BackgroundWorkerConfig>,
     global_stealer: &'static GlobalStealer,
-    worker: Worker<Mem>,
+    worker: Worker<Handle>,
 }
 
 impl BackgroundWorker {
@@ -553,7 +600,7 @@ impl BackgroundWorker {
         }
     }
 
-    fn clear(&self, size_class: &SizeClassState, worker: &Worker<Mem>) -> usize {
+    fn clear(&self, size_class: &SizeClassState, worker: &Worker<Handle>) -> usize {
         let _ = size_class
             .injector
             .steal_batch_with_limit(worker, self.config.batch);
@@ -760,8 +807,8 @@ pub enum Region<T> {
 pub struct MMapRegion<T> {
     /// Vector-representation of the underlying memory. Must not be dropped.
     inner: ManuallyDrop<Vec<T>>,
-    /// The actual memory, so we can recycle it. Option to allow moving.
-    mem: Option<Mem>,
+    /// Opaque handle to lgalloc.
+    handle: Handle,
 }
 
 impl<T> MMapRegion<T> {
@@ -814,27 +861,11 @@ impl<T> Region<T> {
             return Ok(Region::new_heap(capacity));
         }
 
-        // Round up to at least a page.
-        // TODO: This assumes 4k pages.
-        let byte_len = std::cmp::max(0x1000, std::mem::size_of::<T>() * capacity);
-        let size_class = SizeClass::from_byte_size(byte_len)?;
-
-        with_stealer(|s| s.get(size_class)).and_then(|mem| {
-            debug_assert_eq!(mem.len(), size_class.byte_size());
-            let actual_capacity = mem.len() / std::mem::size_of::<T>();
-            let ptr: *mut T = mem.ptr.cast().as_ptr();
-            // Memory region should be page-aligned, which we assume to be larger than any alignment
-            // we might encounter. If this is not the case, bail out.
-            if ptr.align_offset(std::mem::align_of::<T>()) != 0 {
-                return Err(AllocError::UnalignedMemory);
-            }
+        allocate(capacity).map(|(ptr, capacity, handle)| {
             // SAFETY: memory points to suitable memory.
-            let inner = ManuallyDrop::new(unsafe { Vec::from_raw_parts(ptr, 0, actual_capacity) });
-            debug_assert!(std::mem::size_of::<T>() * inner.len() <= mem.len());
-            Ok(Region::MMap(MMapRegion {
-                inner,
-                mem: Some(mem),
-            }))
+            let inner =
+                ManuallyDrop::new(unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, capacity) });
+            Region::MMap(MMapRegion { inner, handle })
         })
     }
 
@@ -973,7 +1004,7 @@ impl<T> Drop for MMapRegion<T> {
     fn drop(&mut self) {
         // Forget reasoning: The vector points to the mapped region, which frees the
         // allocation. Don't drop elements, don't drop vec.
-        with_stealer(|s| s.push(take(&mut self.mem).unwrap()));
+        thread_context(|s| s.free(&mut self.handle));
     }
 }
 
