@@ -51,12 +51,9 @@ unsafe impl Sync for Handle {}
 
 #[allow(clippy::len_without_is_empty)]
 impl Handle {
-    fn new(region: &mut [u8]) -> Self {
-        Self {
-            // SAFETY: `region` known to point to valid memory.
-            ptr: unsafe { NonNull::new_unchecked(region.as_mut_ptr()) },
-            len: region.len(),
-        }
+    /// Construct a new handle from a region of memory
+    fn new(ptr: NonNull<u8>, len: usize) -> Self {
+        Self { ptr, len }
     }
 
     /// Construct a dangling handle, which is only suitable for zero-sized types.
@@ -72,12 +69,12 @@ impl Handle {
     }
 
     /// Length of the memory area in bytes.
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.len
     }
 
     /// Pointer to memory.
-    pub fn as_non_null(&self) -> NonNull<u8> {
+    fn as_non_null(&self) -> NonNull<u8> {
         self.ptr
     }
 
@@ -300,16 +297,17 @@ impl ThreadLocalStealer {
     ///
     /// Returns [`AllocError::Disabled`] if lgalloc is not enabled. Returns other error types
     /// if out of memory, or an internal operation fails.
-    fn alloc(&mut self, size_class: SizeClass) -> Result<Handle, AllocError> {
+    fn allocate(&mut self, size_class: SizeClass) -> Result<Handle, AllocError> {
         if !LGALLOC_ENABLED.load(Ordering::Relaxed) {
             return Err(AllocError::Disabled);
         }
         self.size_classes[size_class.index()].get_with_refill()
     }
 
-    /// Return memory to the allocator. Must have been obtained through `get`.
-    fn free(&self, mem: Handle) {
+    /// Return memory to the allocator. Must have been obtained through [`allocate`].
+    fn deallocate(&self, mem: Handle) {
         let size_class = SizeClass::from_byte_size_unchecked(mem.len());
+
         self.size_classes[size_class.index()].push(mem);
     }
 }
@@ -450,11 +448,23 @@ impl LocalSizeClass {
         );
 
         let mut mmap = Self::init_file(byte_len)?;
-        let mut chunks = mmap.as_mut().chunks_exact_mut(self.size_class.byte_size());
-        let mem = Handle::new(chunks.next().expect("At least once chunk allocated."));
-        for slice in chunks {
-            self.size_class_state.injector.push(Handle::new(slice));
+        // SAFETY: Memory region initialized, so pointers to it are valid.
+        let mut chunks = mmap
+            .as_mut()
+            .chunks_exact_mut(self.size_class.byte_size())
+            .map(|chunk| unsafe { NonNull::new_unchecked(chunk.as_mut_ptr()) });
+
+        // Capture first region to return immediately.
+        let ptr = chunks.next().expect("At least once chunk allocated.");
+        let mem = Handle::new(ptr, self.size_class.byte_size());
+
+        // Stash remaining in the injector.
+        for ptr in chunks {
+            self.size_class_state
+                .injector
+                .push(Handle::new(ptr, self.size_class.byte_size()));
         }
+
         stash.push(ManuallyDrop::new(mmap));
         Ok(mem)
     }
@@ -517,6 +527,7 @@ impl Drop for LocalSizeClass {
     }
 }
 
+/// Access the per-thread context.
 fn thread_context<R, F: FnOnce(&mut ThreadLocalStealer) -> R>(f: F) -> R {
     WORKER.with(|cell| f(&mut cell.borrow_mut()))
 }
@@ -539,13 +550,13 @@ pub fn allocate<T>(capacity: usize) -> Result<(NonNull<T>, usize, Handle), Alloc
     let byte_len = std::cmp::max(0x1000, std::mem::size_of::<T>() * capacity);
     let size_class = SizeClass::from_byte_size(byte_len)?;
 
-    thread_context(|s| s.alloc(size_class)).and_then(|handle| {
+    thread_context(|s| s.allocate(size_class)).and_then(|handle| {
         debug_assert_eq!(handle.len(), size_class.byte_size());
         let ptr: NonNull<T> = handle.as_non_null().cast();
         // Memory region should be page-aligned, which we assume to be larger than any alignment
         // we might encounter. If this is not the case, bail out.
         if ptr.as_ptr().align_offset(std::mem::align_of::<T>()) != 0 {
-            thread_context(move |s| s.free(handle));
+            thread_context(move |s| s.deallocate(handle));
             return Err(AllocError::UnalignedMemory);
         }
         let actual_capacity = handle.len() / std::mem::size_of::<T>();
@@ -561,9 +572,10 @@ pub fn deallocate(handle: Handle) {
     if handle.is_dangling() {
         return;
     }
-    thread_context(|s| s.free(handle))
+    thread_context(|s| s.deallocate(handle))
 }
 
+/// A bacground worker that performs periodic tasks.
 struct BackgroundWorker {
     config: BackgroundWorkerConfig,
     receiver: Receiver<BackgroundWorkerConfig>,
@@ -960,11 +972,11 @@ impl<T> Region<T> {
     #[inline]
     pub fn extend<I: IntoIterator<Item = T> + ExactSizeIterator>(&mut self, iter: I) {
         debug_assert!(self.capacity() - self.len() >= iter.len());
-        self.as_mut().extend(iter);
+        self.as_mut_vec().extend(iter);
     }
 
     #[inline]
-    pub fn as_mut(&mut self) -> &mut Vec<T> {
+    pub fn as_mut_vec(&mut self) -> &mut Vec<T> {
         match self {
             Region::Heap(vec) => vec,
             Region::MMap(inner) => &mut inner.inner,
@@ -976,7 +988,7 @@ impl<T: Clone> Region<T> {
     #[inline]
     pub fn extend_from_slice(&mut self, slice: &[T]) {
         debug_assert!(self.capacity() - self.len() >= slice.len());
-        self.as_mut().extend_from_slice(slice);
+        self.as_mut_vec().extend_from_slice(slice);
     }
 }
 
@@ -992,7 +1004,7 @@ impl<T> Deref for Region<T> {
 impl<T> DerefMut for Region<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.as_mut()
+        self.as_mut_vec()
     }
 }
 
@@ -1013,7 +1025,6 @@ impl<T> Drop for MMapRegion<T> {
     fn drop(&mut self) {
         // Forget reasoning: The vector points to the mapped region, which frees the
         // allocation. Don't drop elements, don't drop vec.
-
         deallocate(self.handle.take().unwrap());
     }
 }
@@ -1045,7 +1056,7 @@ mod test {
     fn test_1() -> Result<(), AllocError> {
         initialize();
         let mut r: Region<u8> = Region::new_auto(4 << 20);
-        r.as_mut().push(1);
+        r.as_mut_vec().push(1);
         drop(r);
         Ok(())
     }
@@ -1055,7 +1066,7 @@ mod test {
     fn test_2() -> Result<(), AllocError> {
         initialize();
         let mut r: Region<u8> = Region::new_auto(4 << 20);
-        r.as_mut().push(1);
+        r.as_mut_vec().push(1);
         Ok(())
     }
 
@@ -1074,7 +1085,7 @@ mod test {
                     i += 1;
                     let mut r: Region<u8> = std::hint::black_box(Region::new_auto(4 << 20));
                     // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
-                    r.as_mut().push(1);
+                    r.as_mut_vec().push(1);
                 }
                 println!("repetitions: {i}");
             }
@@ -1112,7 +1123,7 @@ mod test {
                     buffer.extend((0..batch).map(|_| {
                         let mut r: Region<u8> = std::hint::black_box(Region::new_auto(2 << 20));
                         // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
-                        r.as_mut().push(1);
+                        r.as_mut_vec().push(1);
                         r
                     }));
                     buffer.clear();
@@ -1141,14 +1152,14 @@ mod test {
     #[test]
     #[serial]
     fn leak() {
-        crate::lgalloc_set_config(&LgAlloc {
+        crate::lgalloc_set_config(&crate::LgAlloc {
             enabled: Some(true),
             path: Some(std::env::temp_dir()),
             background_config: None,
         });
         let r = Region::<i32>::new_mmap(10000).unwrap();
 
-        let thread = std::thread::spawn(move || std::mem::forget(r));
+        let thread = std::thread::spawn(move || drop(r));
 
         thread.join().unwrap();
     }
@@ -1157,7 +1168,7 @@ mod test {
     fn test_zst() {
         initialize();
         let mut r = Region::<()>::new_mmap(10).unwrap();
-        r.as_mut().push(());
+        r.as_mut_vec().push(());
         drop(r);
     }
 
