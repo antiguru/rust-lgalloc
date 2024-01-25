@@ -51,17 +51,24 @@ unsafe impl Sync for Handle {}
 
 #[allow(clippy::len_without_is_empty)]
 impl Handle {
-    const NULL: Handle = Handle {
-        ptr: NonNull::dangling(),
-        len: 0,
-    };
-
     fn new(region: &mut [u8]) -> Self {
         Self {
             // SAFETY: `region` known to point to valid memory.
             ptr: unsafe { NonNull::new_unchecked(region.as_mut_ptr()) },
             len: region.len(),
         }
+    }
+
+    /// Construct a dangling handle, which is only suitable for zero-sized types.
+    fn dangling() -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            len: 0,
+        }
+    }
+
+    fn is_dangling(&self) -> bool {
+        self.ptr == NonNull::dangling()
     }
 
     /// Length of the memory area in bytes.
@@ -271,7 +278,7 @@ struct PerThreadState<T> {
 }
 
 /// Per-thread and state, sharded by size class.
-pub struct ThreadLocalStealer {
+struct ThreadLocalStealer {
     /// Per-size-class state
     size_classes: Vec<LocalSizeClass>,
     _phantom: PhantomUnsyncUnsend<Self>,
@@ -293,7 +300,6 @@ impl ThreadLocalStealer {
     ///
     /// Returns [`AllocError::Disabled`] if lgalloc is not enabled. Returns other error types
     /// if out of memory, or an internal operation fails.
-    #[inline]
     fn alloc(&mut self, size_class: SizeClass) -> Result<Handle, AllocError> {
         if !LGALLOC_ENABLED.load(Ordering::Relaxed) {
             return Err(AllocError::Disabled);
@@ -302,10 +308,8 @@ impl ThreadLocalStealer {
     }
 
     /// Return memory to the allocator. Must have been obtained through `get`.
-    #[inline]
-    fn free(&self, mem: &mut Handle) {
+    fn free(&self, mem: Handle) {
         let size_class = SizeClass::from_byte_size_unchecked(mem.len());
-        let mem = std::mem::replace(mem, Handle::NULL);
         self.size_classes[size_class.index()].push(mem);
     }
 }
@@ -513,7 +517,7 @@ impl Drop for LocalSizeClass {
     }
 }
 
-fn thread_context<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
+fn thread_context<R, F: FnOnce(&mut ThreadLocalStealer) -> R>(f: F) -> R {
     WORKER.with(|cell| f(&mut cell.borrow_mut()))
 }
 
@@ -522,23 +526,29 @@ fn thread_context<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
 /// Returns a pointer, a capacity in `T`, and a handle if successful, and an error
 /// otherwise. The capacity can be larger than requested.
 ///
-/// The memory must be freed using [`free`], otherwise the memory leaks. The memory can be freed on a different thread.
+/// The memory must be freed using [`deallocate`], otherwise the memory leaks. The memory can be freed on a different thread.
 pub fn allocate<T>(capacity: usize) -> Result<(NonNull<T>, usize, Handle), AllocError> {
+    if std::mem::size_of::<T>() == 0 {
+        return Ok((NonNull::dangling(), usize::MAX, Handle::dangling()));
+    } else if capacity == 0 {
+        return Ok((NonNull::dangling(), 0, Handle::dangling()));
+    }
+
     // Round up to at least a page.
     // TODO: This assumes 4k pages.
     let byte_len = std::cmp::max(0x1000, std::mem::size_of::<T>() * capacity);
     let size_class = SizeClass::from_byte_size(byte_len)?;
 
-    thread_context(|s| s.alloc(size_class)).and_then(|mut handle| {
+    thread_context(|s| s.alloc(size_class)).and_then(|handle| {
         debug_assert_eq!(handle.len(), size_class.byte_size());
-        let actual_capacity = handle.len() / std::mem::size_of::<T>();
         let ptr: NonNull<T> = handle.as_non_null().cast();
         // Memory region should be page-aligned, which we assume to be larger than any alignment
         // we might encounter. If this is not the case, bail out.
         if ptr.as_ptr().align_offset(std::mem::align_of::<T>()) != 0 {
-            thread_context(|s| s.free(&mut handle));
+            thread_context(move |s| s.free(handle));
             return Err(AllocError::UnalignedMemory);
         }
+        let actual_capacity = handle.len() / std::mem::size_of::<T>();
         Ok((ptr, actual_capacity, handle))
     })
 }
@@ -547,8 +557,11 @@ pub fn allocate<T>(capacity: usize) -> Result<(NonNull<T>, usize, Handle), Alloc
 ///
 /// This function cannot fail. The caller must not access the memory after freeing it. The caller is responsible
 /// for dropping/forgetting data.
-pub fn free(mut handle: Handle) {
-    thread_context(|s| s.free(&mut handle))
+pub fn deallocate(handle: Handle) {
+    if handle.is_dangling() {
+        return;
+    }
+    thread_context(|s| s.free(handle))
 }
 
 struct BackgroundWorker {
@@ -808,7 +821,7 @@ pub struct MMapRegion<T> {
     /// Vector-representation of the underlying memory. Must not be dropped.
     inner: ManuallyDrop<Vec<T>>,
     /// Opaque handle to lgalloc.
-    handle: Handle,
+    handle: Option<Handle>,
 }
 
 impl<T> MMapRegion<T> {
@@ -856,15 +869,11 @@ impl<T> Region<T> {
     /// Returns an error if the memory allocation fails.
     #[inline(always)]
     pub fn new_mmap(capacity: usize) -> Result<Region<T>, AllocError> {
-        if std::mem::size_of::<T>() == 0 || capacity == 0 {
-            // Handle zero-sized types.
-            return Ok(Region::new_heap(capacity));
-        }
-
         allocate(capacity).map(|(ptr, capacity, handle)| {
             // SAFETY: memory points to suitable memory.
             let inner =
                 ManuallyDrop::new(unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, capacity) });
+            let handle = Some(handle);
             Region::MMap(MMapRegion { inner, handle })
         })
     }
@@ -955,7 +964,7 @@ impl<T> Region<T> {
     }
 
     #[inline]
-    fn as_mut(&mut self) -> &mut Vec<T> {
+    pub fn as_mut(&mut self) -> &mut Vec<T> {
         match self {
             Region::Heap(vec) => vec,
             Region::MMap(inner) => &mut inner.inner,
@@ -1004,7 +1013,8 @@ impl<T> Drop for MMapRegion<T> {
     fn drop(&mut self) {
         // Forget reasoning: The vector points to the mapped region, which frees the
         // allocation. Don't drop elements, don't drop vec.
-        thread_context(|s| s.free(&mut self.handle));
+
+        deallocate(self.handle.take().unwrap());
     }
 }
 
@@ -1131,15 +1141,35 @@ mod test {
     #[test]
     #[serial]
     fn leak() {
-        crate::lgalloc_set_config(&crate::LgAlloc {
+        crate::lgalloc_set_config(&LgAlloc {
             enabled: Some(true),
             path: Some(std::env::temp_dir()),
             background_config: None,
         });
         let r = Region::<i32>::new_mmap(10000).unwrap();
 
-        let thread = std::thread::spawn(move || drop(r));
+        let thread = std::thread::spawn(move || std::mem::forget(r));
 
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_zst() {
+        initialize();
+        let mut r = Region::<()>::new_mmap(10).unwrap();
+        r.as_mut().push(());
+        drop(r);
+    }
+
+    #[test]
+    fn test_zero_capacity_zst() {
+        initialize();
+        Region::<()>::new_mmap(0).unwrap();
+    }
+
+    #[test]
+    fn test_zero_capacity_nonzst() {
+        initialize();
+        Region::<u8>::new_mmap(0).unwrap();
     }
 }
