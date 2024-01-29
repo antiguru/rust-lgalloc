@@ -103,7 +103,7 @@ const LOCAL_BUFFER_BYTES: usize = 32 << 20;
 const INITIAL_SIZE: usize = 32 << 20;
 
 /// Range of valid size classes.
-pub const VALID_SIZE_CLASS: Range<usize> = 16..33;
+pub const VALID_SIZE_CLASS: Range<usize> = 10..37;
 
 /// Strategy to indicate that the OS can reclaim pages
 // TODO: On Linux, we want to use MADV_REMOVE, but that's only supported
