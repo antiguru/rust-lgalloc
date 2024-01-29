@@ -32,6 +32,7 @@ use std::thread::{spawn, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use libc::sysconf;
 use memmap2::MmapMut;
 use thiserror::Error;
 
@@ -546,8 +547,9 @@ pub fn allocate<T>(capacity: usize) -> Result<(NonNull<T>, usize, Handle), Alloc
     }
 
     // Round up to at least a page.
-    // TODO: This assumes 4k pages.
-    let byte_len = std::cmp::max(0x1000, std::mem::size_of::<T>() * capacity);
+    let byte_len = std::cmp::max(page_size::get(), std::mem::size_of::<T>() * capacity);
+    // With above rounding up to page sizes, we only allocate multiples of page size because
+    // we only support powers-of-two sized regions.
     let size_class = SizeClass::from_byte_size(byte_len)?;
 
     thread_context(|s| s.allocate(size_class)).and_then(|handle| {
