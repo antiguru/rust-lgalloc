@@ -32,7 +32,6 @@ use std::thread::{spawn, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
-use libc::sysconf;
 use memmap2::MmapMut;
 use thiserror::Error;
 
