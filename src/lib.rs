@@ -17,6 +17,8 @@
 //! Clients must not lock pages (`mlock`), or need to unlock the pages before returning them
 //! to lgalloc.
 
+#![deny(missing_docs)]
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -80,13 +82,26 @@ impl Handle {
 
     /// Indicate that the memory is not in use and that the OS can recycle it.
     fn clear(&mut self) -> std::io::Result<()> {
+        // SAFETY: `MADV_DONTNEED_STRATEGY` guaranteed to be a valid argument.
+        unsafe { self.madvise(MADV_DONTNEED_STRATEGY) }
+    }
+
+    /// Indicate that the memory is not in use and that the OS can recycle it.
+    fn fast_clear(&mut self) -> std::io::Result<()> {
+        // SAFETY: `libc::MADV_DONTNEED` documented to be a valid argument.
+        unsafe { self.madvise(libc::MADV_DONTNEED) }
+    }
+
+    /// Call `madvise` on the memory region. Unsafe because `advice` is passed verbatim.
+    unsafe fn madvise(&self, advice: libc::c_int) -> std::io::Result<()> {
         // SAFETY: Calling into `madvise`:
         // * The ptr is page-aligned by construction.
         // * The ptr + length is page-aligned by construction (not required but surprising otherwise)
         // * Mapped shared and writable (for MADV_REMOVE),
         // * Pages not locked.
+        // * The caller is responsible for passing a valid `advice` parameter.
         let ptr = self.as_non_null().as_ptr().cast();
-        let ret = unsafe { libc::madvise(ptr, self.len, MADV_DONTNEED_STRATEGY) };
+        let ret = unsafe { libc::madvise(ptr, self.len, advice) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             eprintln!("madvise failed: {ret} {err:?}",);
@@ -132,6 +147,7 @@ pub enum AllocError {
     /// Allocator disabled
     #[error("Disabled by configuration")]
     Disabled,
+    /// Failed to allocate memory that suits alignment properties.
     #[error("Memory unsuitable for requested alignment")]
     UnalignedMemory,
 }
@@ -206,6 +222,9 @@ static INJECTOR: OnceLock<GlobalStealer> = OnceLock::new();
 
 /// Enabled switch to turn on or off lgalloc. Off by default.
 static LGALLOC_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable eager returning of memory. Off by default.
+static LGALLOC_EAGER_RETURN: AtomicBool = AtomicBool::new(false);
 
 /// Type maintaining the global state for each size class.
 struct GlobalStealer {
@@ -425,10 +444,13 @@ impl LocalSizeClass {
     }
 
     /// Recycle memory. Stores it locally or forwards it to the global state.
-    fn push(&self, mem: Handle) {
+    fn push(&self, mut mem: Handle) {
         debug_assert_eq!(mem.len(), self.size_class.byte_size());
         self.stats.deallocations.fetch_add(1, Ordering::Relaxed);
         if self.worker.len() >= LOCAL_BUFFER_BYTES / self.size_class.byte_size() {
+            if LGALLOC_EAGER_RETURN.load(Ordering::Relaxed) {
+                mem.fast_clear().expect("clearing successful");
+            }
             self.size_class_state.injector.push(mem);
         } else {
             self.worker.push(mem);
@@ -576,7 +598,7 @@ pub fn deallocate(handle: Handle) {
     thread_context(|s| s.deallocate(handle))
 }
 
-/// A bacground worker that performs periodic tasks.
+/// A background worker that performs periodic tasks.
 struct BackgroundWorker {
     config: BackgroundWorkerConfig,
     receiver: Receiver<BackgroundWorkerConfig>,
@@ -659,6 +681,10 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
         LGALLOC_ENABLED.store(*enabled, Ordering::Relaxed);
     }
 
+    if let Some(eager_return) = &config.eager_return {
+        LGALLOC_EAGER_RETURN.store(*eager_return, Ordering::Relaxed);
+    }
+
     if let Some(path) = &config.path {
         *stealer.path.write().unwrap() = Some(path.clone());
     }
@@ -702,6 +728,8 @@ pub struct LgAlloc {
     pub path: Option<PathBuf>,
     /// Configuration of the background worker.
     pub background_config: Option<BackgroundWorkerConfig>,
+    /// Whether to return physical memory on deallocate
+    pub eager_return: Option<bool>,
 }
 
 impl LgAlloc {
@@ -710,6 +738,7 @@ impl LgAlloc {
         Self::default()
     }
 
+    /// Enable lgalloc globally.
     pub fn enable(&mut self) -> &mut Self {
         self.enabled = Some(true);
         self
@@ -724,6 +753,12 @@ impl LgAlloc {
     /// Set the area file path.
     pub fn with_path(&mut self, path: PathBuf) -> &mut Self {
         self.path = Some(path);
+        self
+    }
+
+    /// Enable eager memory reclamation.
+    pub fn eager_return(&mut self, eager_return: bool) -> &mut Self {
+        self.eager_return = Some(eager_return);
         self
     }
 }
@@ -789,12 +824,14 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
     }
 }
 
+/// Statistics about lgalloc's internal behavior.
 #[derive(Debug, Default)]
 pub struct LgAllocStats {
     /// Per size-class statistics.
     pub size_class: Vec<SizeClassStats>,
 }
 
+/// Statistics per size class.
 #[derive(Debug)]
 pub struct SizeClassStats {
     /// Size class in bytes
@@ -970,12 +1007,16 @@ impl<T> Region<T> {
         }
     }
 
+    /// Extend the region from the contents of the iterator. The caller has to ensure the region
+    /// has sufficient capacity.
     #[inline]
     pub fn extend<I: IntoIterator<Item = T> + ExactSizeIterator>(&mut self, iter: I) {
         debug_assert!(self.capacity() - self.len() >= iter.len());
         self.as_mut_vec().extend(iter);
     }
 
+    /// Obtain a vector representation of the region. The caller has to ensure the vector does
+    /// not reallocate its underlying storage.
     #[inline]
     pub fn as_mut_vec(&mut self) -> &mut Vec<T> {
         match self {
@@ -986,6 +1027,8 @@ impl<T> Region<T> {
 }
 
 impl<T: Clone> Region<T> {
+    /// Extend the region from the contents of the slice. The caller has to ensure the region
+    /// has sufficient capacity.
     #[inline]
     pub fn extend_from_slice(&mut self, slice: &[T]) {
         debug_assert!(self.capacity() - self.len() >= slice.len());
@@ -1157,6 +1200,7 @@ mod test {
             enabled: Some(true),
             path: Some(std::env::temp_dir()),
             background_config: None,
+            eager_return: None,
         });
         let r = Region::<i32>::new_mmap(10000).unwrap();
 
