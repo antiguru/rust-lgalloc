@@ -21,8 +21,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::File;
 use std::marker::PhantomData;
-use std::mem::{take, ManuallyDrop};
+use std::mem::{take, ManuallyDrop, MaybeUninit};
 use std::ops::{Deref, DerefMut, Range};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
@@ -243,7 +244,7 @@ struct SizeClassState {
     /// Handle to memory-mapped regions.
     ///
     /// We must never dereference the memory-mapped regions stored here.
-    areas: RwLock<Vec<ManuallyDrop<MmapMut>>>,
+    areas: RwLock<Vec<ManuallyDrop<(File, MmapMut)>>>,
     /// Injector to distribute memory globally.
     injector: Injector<Handle>,
     /// Injector to distribute memory globally, freed memory.
@@ -466,10 +467,10 @@ impl LocalSizeClass {
 
         let byte_len = stash.iter().last().map_or_else(
             || std::cmp::max(INITIAL_SIZE, self.size_class.byte_size()),
-            |mmap| mmap.len() * 2,
+            |mmap| mmap.1.len() * 2,
         );
 
-        let mut mmap = Self::init_file(byte_len)?;
+        let (file, mut mmap) = Self::init_file(byte_len)?;
         // SAFETY: Memory region initialized, so pointers to it are valid.
         let mut chunks = mmap
             .as_mut()
@@ -487,13 +488,13 @@ impl LocalSizeClass {
                 .push(Handle::new(ptr, self.size_class.byte_size()));
         }
 
-        stash.push(ManuallyDrop::new(mmap));
+        stash.push(ManuallyDrop::new((file, mmap)));
         Ok(mem)
     }
 
     /// Allocate and map a file of size `byte_len`. Returns an handle, or error if the allocation
     /// fails.
-    fn init_file(byte_len: usize) -> Result<MmapMut, AllocError> {
+    fn init_file(byte_len: usize) -> Result<(File, MmapMut), AllocError> {
         let path = GlobalStealer::get_static().path.read().unwrap().clone();
         let Some(path) = path else {
             return Err(AllocError::Io(std::io::Error::from(
@@ -501,12 +502,10 @@ impl LocalSizeClass {
             )));
         };
         let file = tempfile::tempfile_in(path)?;
+        let fd = file.as_fd().as_raw_fd();
         // SAFETY: Calling ftruncate on the file, which we just created.
         unsafe {
-            let ret = libc::ftruncate(
-                file.as_fd().as_raw_fd(),
-                libc::off_t::try_from(byte_len).expect("Must fit"),
-            );
+            let ret = libc::ftruncate(fd, libc::off_t::try_from(byte_len).expect("Must fit"));
             if ret != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
@@ -514,7 +513,7 @@ impl LocalSizeClass {
         // SAFETY: We only map `file` once, and never share it with other processes.
         let mmap = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
         assert_eq!(mmap.len(), byte_len);
-        Ok(mmap)
+        Ok((file, mmap))
     }
 }
 
@@ -763,11 +762,216 @@ impl LgAlloc {
     }
 }
 
+/// Utilities to parse `numa_maps`, which only exists on Linux.
+mod numa_map {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+    use std::path::PathBuf;
+    use std::str::FromStr;
+
+    #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
+    enum NumaMapProperty {
+        File(PathBuf),
+        N(usize, usize),
+        Heap,
+        Stack,
+        Huge,
+        Anon(usize),
+        Dirty(usize),
+        Mapped(usize),
+        MapMax(usize),
+        SwapCache(usize),
+        Active(usize),
+        Writeback(usize),
+        KernelpagesizeKB(usize),
+    }
+
+    impl NumaMapProperty {
+        fn page_size(&self) -> Option<usize> {
+            match self {
+                NumaMapProperty::KernelpagesizeKB(page_size) => Some(*page_size),
+                _ => None,
+            }
+        }
+
+        fn normalize(self, page_size: usize) -> Option<NumaMapProperty> {
+            use NumaMapProperty::*;
+            match self {
+                File(p) => Some(File(p)),
+                N(node, pages) => Some(N(node, pages * page_size)),
+                Heap => Some(Heap),
+                Stack => Some(Stack),
+                Huge => Some(Huge),
+                Anon(pages) => Some(Anon(pages * page_size)),
+                Dirty(pages) => Some(Dirty(pages * page_size)),
+                Mapped(pages) => Some(Mapped(pages * page_size)),
+                MapMax(pages) => Some(MapMax(pages * page_size)),
+                SwapCache(pages) => Some(SwapCache(pages * page_size)),
+                Active(pages) => Some(Active(pages * page_size)),
+                Writeback(pages) => Some(Writeback(pages * page_size)),
+                KernelpagesizeKB(_) => None,
+            }
+        }
+    }
+
+    impl FromStr for NumaMapProperty {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            let (key, val) = if let Some(index) = s.find('=') {
+                let (key, val) = s.split_at(index);
+                (key, Some(&val[1..]))
+            } else {
+                (s, None)
+            };
+            match (key, val) {
+                (key, Some(val)) if key.starts_with('N') => {
+                    let node = key[1..].parse().map_err(|e| format!("{e}"))?;
+                    let count = val.parse().map_err(|e| format!("{e}"))?;
+                    Ok(NumaMapProperty::N(node, count))
+                }
+                ("file", Some(val)) => Ok(NumaMapProperty::File(PathBuf::from(val))),
+                ("heap", _) => Ok(NumaMapProperty::Heap),
+                ("stack", _) => Ok(NumaMapProperty::Stack),
+                ("huge", _) => Ok(NumaMapProperty::Huge),
+                ("anon", Some(val)) => val
+                    .parse()
+                    .map(NumaMapProperty::Anon)
+                    .map_err(|e| format!("{e}")),
+                ("dirty", Some(val)) => val
+                    .parse()
+                    .map(NumaMapProperty::Dirty)
+                    .map_err(|e| format!("{e}")),
+                ("mapped", Some(val)) => val
+                    .parse()
+                    .map(NumaMapProperty::Mapped)
+                    .map_err(|e| format!("{e}")),
+                ("mapmax", Some(val)) => val
+                    .parse()
+                    .map(NumaMapProperty::MapMax)
+                    .map_err(|e| format!("{e}")),
+                ("swapcache", Some(val)) => val
+                    .parse()
+                    .map(NumaMapProperty::SwapCache)
+                    .map_err(|e| format!("{e}")),
+                ("active", Some(val)) => val
+                    .parse()
+                    .map(NumaMapProperty::Active)
+                    .map_err(|e| format!("{e}")),
+                ("writeback", Some(val)) => val
+                    .parse()
+                    .map(NumaMapProperty::Writeback)
+                    .map_err(|e| format!("{e}")),
+                ("kernelpagesize_kB", Some(val)) => val
+                    .parse()
+                    .map(|sz: usize| NumaMapProperty::KernelpagesizeKB(sz << 10))
+                    .map_err(|e| format!("{e}")),
+                (key, None) => Err(format!("unknown key: {key}")),
+                (key, Some(val)) => Err(format!("unknown key/value: {key}={val}")),
+            }
+        }
+    }
+
+    fn parse_numa_map(line: &str) -> Option<NumaMapEntry> {
+        let mut parts = line.split_whitespace();
+        let address = <usize>::from_str_radix(parts.next()?, 16).ok()?;
+        let _default = parts.next();
+        let mut properties = Vec::new();
+        let mut page_size = None;
+        for part in parts {
+            match part.parse::<NumaMapProperty>() {
+                Ok(property) => {
+                    if let Some(page_sz) = property.page_size() {
+                        page_size = Some(page_sz);
+                    }
+                    properties.push(property);
+                }
+                Err(err) => eprintln!("Failed to parse numa_map entry \"{part}\": {err}"),
+            }
+        }
+        if let Some(page_size) = page_size {
+            properties = properties
+                .into_iter()
+                .flat_map(|p| NumaMapProperty::normalize(p, page_size))
+                .collect();
+            properties.sort();
+        }
+        Some(NumaMapEntry {
+            properties,
+            address,
+        })
+    }
+
+    #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
+    struct NumaMapEntry {
+        address: usize,
+        properties: Vec<NumaMapProperty>,
+    }
+
+    #[derive(Default)]
+    pub(crate) struct NumaMap {
+        entries: Vec<NumaMapEntry>,
+    }
+
+    impl NumaMap {
+        pub(crate) fn read_numa_maps() -> std::io::Result<Self> {
+            let file = File::open("/proc/self/numa_maps")?;
+            let reader = BufReader::new(file);
+
+            let mut entries = Vec::new();
+            for line in reader.lines() {
+                if let Some(entry) = parse_numa_map(&(line?)) {
+                    entries.push(entry);
+                }
+            }
+            entries.sort_by_key(|entry| entry.address);
+            Ok(Self { entries })
+        }
+
+        /// Returns (mapped, active, dirty) in bytes. Substitutes zero values if not found.
+        pub(crate) fn get_stats(&self, base: usize) -> (usize, usize, usize) {
+            let entry = match self
+                .entries
+                .binary_search_by(|entry| entry.address.cmp(&base))
+            {
+                Ok(pos) => Some(&self.entries[pos]),
+                Err(_pos) => {
+                    // `numa_maps` only updates periodically, so we might be missing some
+                    // expected entries.
+                    None
+                }
+            };
+
+            let mut mapped = 0;
+            let mut active = 0;
+            let mut dirty = 0;
+            for property in entry.iter().flat_map(|e| e.properties.iter()) {
+                match property {
+                    NumaMapProperty::Dirty(d) => dirty = *d,
+                    NumaMapProperty::Mapped(m) => mapped = *m,
+                    NumaMapProperty::Active(a) => active = *a,
+                    _ => {}
+                }
+            }
+            (mapped, active, dirty)
+        }
+    }
+}
+
 /// Determine global statistics per size class
 ///
 /// Note that this function take a read lock on various structures.
 pub fn lgalloc_stats(stats: &mut LgAllocStats) {
     stats.size_class.clear();
+    stats.file_stats.clear();
+
+    // `numa_maps` only exists on Linux, don't spam errors on other OSs.
+    #[cfg(target_os = "linux")]
+    let numa_map = numa_map::NumaMap::read_numa_maps()
+        .map_err(|e| eprintln!("Failed to parse numa_maps: {e}"))
+        .unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    let numa_map = numa_map::NumaMap::read_numa_maps().unwrap_or_default();
 
     let global = GlobalStealer::get_static();
 
@@ -782,7 +986,7 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
         }
 
         let size_class = size_class.byte_size();
-        let area_total_bytes = areas_lock.iter().map(|area| area.len()).sum();
+        let area_total_bytes = areas_lock.iter().map(|area| area.1.len()).sum();
         let global_regions = size_class_state.injector.len();
         let clean_regions = size_class_state.clean_injector.len();
         let stealers = size_class_state.stealers.read().unwrap();
@@ -821,6 +1025,28 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
             refill,
             slow_path,
         });
+
+        for (file, mmap) in areas_lock.iter().map(ManuallyDrop::deref) {
+            let (mapped, active, dirty) = numa_map.get_stats(mmap.as_ptr().cast::<()>() as usize);
+
+            let mut stat: MaybeUninit<libc::stat> = MaybeUninit::uninit();
+            let stat = unsafe {
+                libc::fstat(file.as_raw_fd(), stat.as_mut_ptr());
+                stat.assume_init_ref()
+            };
+
+            let blocks: usize = stat.st_blocks.try_into().unwrap();
+
+            stats.file_stats.push(FileStats {
+                size_class,
+                file_size: stat.st_size.try_into().unwrap(),
+                // Documented as multiples of 512
+                allocated_size: blocks * 512,
+                mapped,
+                active,
+                dirty,
+            })
+        }
     }
 }
 
@@ -829,6 +1055,8 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
 pub struct LgAllocStats {
     /// Per size-class statistics.
     pub size_class: Vec<SizeClassStats>,
+    /// Per size-class and backing file statistics.
+    pub file_stats: Vec<FileStats>,
 }
 
 /// Statistics per size class.
@@ -856,6 +1084,23 @@ pub struct SizeClassStats {
     pub refill: u64,
     /// Total deallocations
     pub deallocations: u64,
+}
+
+/// Statistics per size class and backing file.
+#[derive(Debug)]
+pub struct FileStats {
+    /// The size class in bytes.
+    pub size_class: usize,
+    /// The size of the file in bytes.
+    pub file_size: usize,
+    /// Size of the file on disk in bytes.
+    pub allocated_size: usize,
+    /// Number of mapped bytes, if different from `dirty`. Consult `man 7 numa` for details.
+    pub mapped: usize,
+    /// Number of active bytes. Consult `man 7 numa` for details.
+    pub active: usize,
+    /// Number of dirty bytes. Consult `man 7 numa` for details.
+    pub dirty: usize,
 }
 
 /// An abstraction over different kinds of allocated regions.
@@ -1081,7 +1326,10 @@ mod test {
 
     use serial_test::serial;
 
-    use crate::{AllocError, BackgroundWorkerConfig, LgAlloc, Region};
+    use crate::{
+        allocate, deallocate, lgalloc_stats, AllocError, BackgroundWorkerConfig, LgAlloc,
+        LgAllocStats, Region,
+    };
 
     fn initialize() {
         crate::lgalloc_set_config(
@@ -1227,5 +1475,19 @@ mod test {
     fn test_zero_capacity_nonzst() {
         initialize();
         Region::<u8>::new_mmap(0).unwrap();
+    }
+
+    #[test]
+    fn test_stats() -> Result<(), AllocError> {
+        initialize();
+        let (_ptr, _cap, handle) = allocate::<usize>(1024)?;
+        deallocate(handle);
+
+        let mut stats = LgAllocStats::default();
+        lgalloc_stats(&mut stats);
+
+        assert!(!stats.size_class.is_empty());
+
+        Ok(())
     }
 }
