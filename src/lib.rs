@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::marker::PhantomData;
 use std::mem::{take, ManuallyDrop, MaybeUninit};
-use std::ops::{Deref, DerefMut, Range};
+use std::ops::{Deref, Range};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -165,11 +165,6 @@ impl AllocError {
 struct SizeClass(usize);
 
 impl SizeClass {
-    /// Smallest supported size class
-    const MIN: SizeClass = SizeClass::new_unchecked(VALID_SIZE_CLASS.start);
-    /// Largest supported size class
-    const MAX: SizeClass = SizeClass::new_unchecked(VALID_SIZE_CLASS.end);
-
     const fn new_unchecked(value: usize) -> Self {
         Self(value)
     }
@@ -1103,223 +1098,10 @@ pub struct FileStats {
     pub dirty: usize,
 }
 
-/// An abstraction over different kinds of allocated regions.
-pub enum Region<T> {
-    /// A possibly empty heap-allocated region, represented as a vector.
-    Heap(Vec<T>),
-    /// A mmaped region, represented by a vector and its backing memory mapping.
-    MMap(MMapRegion<T>),
-}
-
-/// Type encapsulating private data for memory-mapped regions.
-pub struct MMapRegion<T> {
-    /// Vector-representation of the underlying memory. Must not be dropped.
-    inner: ManuallyDrop<Vec<T>>,
-    /// Opaque handle to lgalloc.
-    handle: Option<Handle>,
-}
-
-impl<T> MMapRegion<T> {
-    /// Clear the contents of this region without dropping elements.
-    unsafe fn clear(&mut self) {
-        self.inner.set_len(0);
-    }
-}
-
-impl<T> Deref for MMapRegion<T> {
-    type Target = [T];
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<T> Default for Region<T> {
-    #[inline]
-    fn default() -> Self {
-        Self::new_empty()
-    }
-}
-
-impl<T> Region<T> {
-    /// Create a new empty region.
-    #[inline]
-    #[must_use]
-    pub fn new_empty() -> Region<T> {
-        Region::Heap(Vec::new())
-    }
-
-    /// Create a new heap-allocated region of a specific capacity.
-    #[inline]
-    #[must_use]
-    pub fn new_heap(capacity: usize) -> Region<T> {
-        Region::Heap(Vec::with_capacity(capacity))
-    }
-
-    /// Create a new file-based mapped region of a specific capacity. The capacity of the
-    /// returned region can be larger than requested to accommodate page sizes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the memory allocation fails.
-    #[inline(always)]
-    pub fn new_mmap(capacity: usize) -> Result<Region<T>, AllocError> {
-        allocate(capacity).map(|(ptr, capacity, handle)| {
-            // SAFETY: memory points to suitable memory.
-            let inner =
-                ManuallyDrop::new(unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, capacity) });
-            let handle = Some(handle);
-            Region::MMap(MMapRegion { inner, handle })
-        })
-    }
-
-    /// Create a region depending on the capacity.
-    ///
-    /// The capacity of the returned region must be at least as large as the requested capacity,
-    /// but can be larger if the implementation requires it.
-    ///
-    /// Crates a [`Region::Nil`] for empty capacities, a [`Region::Heap`] for allocations up to 2
-    /// Mib, and [`Region::MMap`] for larger capacities.
-    #[must_use]
-    pub fn new_auto(capacity: usize) -> Region<T> {
-        if std::mem::size_of::<T>() == 0 || capacity == 0 {
-            // Handle zero-sized types.
-            return Region::new_heap(capacity);
-        }
-        let bytes = std::mem::size_of::<T>() * capacity;
-        if bytes < SizeClass::MIN.byte_size() || bytes > SizeClass::MAX.byte_size() {
-            Region::new_heap(capacity)
-        } else {
-            Region::new_mmap(capacity).unwrap_or_else(|err| {
-                if !err.is_disabled() {
-                    eprintln!("Mmap pool exhausted, falling back to heap: {err}");
-                }
-                Region::new_heap(capacity)
-            })
-        }
-    }
-
-    /// Clears the contents of the region, without dropping its elements.
-    ///
-    /// # Safety
-    ///
-    /// Discards all contends. Elements are not dropped.
-    #[inline]
-    pub unsafe fn clear(&mut self) {
-        match self {
-            Region::Heap(vec) => vec.set_len(0),
-            Region::MMap(inner) => inner.clear(),
-        }
-    }
-
-    /// Returns the capacity of the underlying allocation.
-    #[inline]
-    #[must_use]
-    pub fn capacity(&self) -> usize {
-        match self {
-            Region::Heap(vec) => vec.capacity(),
-            Region::MMap(inner) => inner.inner.capacity(),
-        }
-    }
-
-    /// Returns the number of elements in the allocation.
-    #[inline]
-    #[must_use]
-    pub fn len(&self) -> usize {
-        match self {
-            Region::Heap(vec) => vec.len(),
-            Region::MMap(inner) => inner.len(),
-        }
-    }
-
-    /// Returns true if the region does not contain any elements.
-    #[inline]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        match self {
-            Region::Heap(vec) => vec.is_empty(),
-            Region::MMap(inner) => inner.is_empty(),
-        }
-    }
-
-    /// Dereference to the contained vector
-    #[inline]
-    #[must_use]
-    pub fn as_vec(&self) -> &Vec<T> {
-        match self {
-            Region::Heap(vec) => vec,
-            Region::MMap(inner) => &inner.inner,
-        }
-    }
-
-    /// Extend the region from the contents of the iterator. The caller has to ensure the region
-    /// has sufficient capacity.
-    #[inline]
-    pub fn extend<I: IntoIterator<Item = T> + ExactSizeIterator>(&mut self, iter: I) {
-        debug_assert!(self.capacity() - self.len() >= iter.len());
-        self.as_mut_vec().extend(iter);
-    }
-
-    /// Obtain a vector representation of the region. The caller has to ensure the vector does
-    /// not reallocate its underlying storage.
-    #[inline]
-    pub fn as_mut_vec(&mut self) -> &mut Vec<T> {
-        match self {
-            Region::Heap(vec) => vec,
-            Region::MMap(inner) => &mut inner.inner,
-        }
-    }
-}
-
-impl<T: Clone> Region<T> {
-    /// Extend the region from the contents of the slice. The caller has to ensure the region
-    /// has sufficient capacity.
-    #[inline]
-    pub fn extend_from_slice(&mut self, slice: &[T]) {
-        debug_assert!(self.capacity() - self.len() >= slice.len());
-        self.as_mut_vec().extend_from_slice(slice);
-    }
-}
-
-impl<T> Deref for Region<T> {
-    type Target = [T];
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.as_vec()
-    }
-}
-
-impl<T> DerefMut for Region<T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.as_mut_vec()
-    }
-}
-
-impl<T> Drop for Region<T> {
-    #[inline]
-    fn drop(&mut self) {
-        match self {
-            Region::Heap(vec) => {
-                // SAFETY: Don't drop the elements, drop the vec.
-                unsafe { vec.set_len(0) }
-            }
-            Region::MMap(_) => {}
-        }
-    }
-}
-
-impl<T> Drop for MMapRegion<T> {
-    fn drop(&mut self) {
-        // Forget reasoning: The vector points to the mapped region, which frees the
-        // allocation. Don't drop elements, don't drop vec.
-        deallocate(self.handle.take().unwrap());
-    }
-}
-
 #[cfg(test)]
 mod test {
+    use std::mem::MaybeUninit;
+    use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1327,8 +1109,8 @@ mod test {
     use serial_test::serial;
 
     use crate::{
-        allocate, deallocate, lgalloc_stats, AllocError, BackgroundWorkerConfig, LgAlloc,
-        LgAllocStats, Region,
+        allocate, deallocate, lgalloc_stats, AllocError, BackgroundWorkerConfig, Handle, LgAlloc,
+        LgAllocStats,
     };
 
     fn initialize() {
@@ -1343,22 +1125,39 @@ mod test {
         );
     }
 
-    #[test]
-    #[serial]
-    fn test_1() -> Result<(), AllocError> {
-        initialize();
-        let mut r: Region<u8> = Region::new_auto(4 << 20);
-        r.as_mut_vec().push(1);
-        drop(r);
-        Ok(())
+    struct Wrapper<T> {
+        handle: MaybeUninit<Handle>,
+        ptr: NonNull<MaybeUninit<T>>,
+        cap: usize,
+    }
+
+    unsafe impl<T: Send> Send for Wrapper<T> {}
+    unsafe impl<T: Sync> Sync for Wrapper<T> {}
+
+    impl<T> Wrapper<T> {
+        fn allocate(capacity: usize) -> Result<Self, AllocError> {
+            let (ptr, cap, handle) = allocate(capacity)?;
+            assert!(cap > 0);
+            let handle = MaybeUninit::new(handle);
+            Ok(Self { ptr, cap, handle })
+        }
+
+        fn as_slice(&mut self) -> &mut [MaybeUninit<T>] {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) }
+        }
+    }
+
+    impl<T> Drop for Wrapper<T> {
+        fn drop(&mut self) {
+            unsafe { deallocate(self.handle.assume_init_read()) };
+        }
     }
 
     #[test]
     #[serial]
-    fn test_2() -> Result<(), AllocError> {
+    fn test_1() -> Result<(), AllocError> {
         initialize();
-        let mut r: Region<u8> = Region::new_auto(4 << 20);
-        r.as_mut_vec().push(1);
+        <Wrapper<u8>>::allocate(4 << 20)?.as_slice()[0] = MaybeUninit::new(1);
         Ok(())
     }
 
@@ -1375,9 +1174,8 @@ mod test {
                 let until = &*until;
                 while until.load(Ordering::Relaxed) {
                     i += 1;
-                    let mut r: Region<u8> = std::hint::black_box(Region::new_auto(4 << 20));
-                    // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
-                    r.as_mut_vec().push(1);
+                    let mut r = <Wrapper<u8>>::allocate(4 << 20).unwrap();
+                    r.as_slice()[0] = MaybeUninit::new(1);
                 }
                 println!("repetitions: {i}");
             }
@@ -1413,9 +1211,8 @@ mod test {
                 while until.load(Ordering::Relaxed) {
                     i += 64;
                     buffer.extend((0..batch).map(|_| {
-                        let mut r: Region<u8> = std::hint::black_box(Region::new_auto(2 << 20));
-                        // r.as_mut().extend(std::iter::repeat(0).take(2 << 20));
-                        r.as_mut_vec().push(1);
+                        let mut r = <Wrapper<u8>>::allocate(2 << 20).unwrap();
+                        r.as_slice()[0] = MaybeUninit::new(1);
                         r
                     }));
                     buffer.clear();
@@ -1443,38 +1240,40 @@ mod test {
 
     #[test]
     #[serial]
-    fn leak() {
+    fn leak() -> Result<(), AllocError> {
         crate::lgalloc_set_config(&crate::LgAlloc {
             enabled: Some(true),
             path: Some(std::env::temp_dir()),
             background_config: None,
             eager_return: None,
         });
-        let r = Region::<i32>::new_mmap(10000).unwrap();
+        let r = <Wrapper<u8>>::allocate(1000)?;
 
         let thread = std::thread::spawn(move || drop(r));
 
         thread.join().unwrap();
+        Ok(())
     }
 
     #[test]
-    fn test_zst() {
+    fn test_zst() -> Result<(), AllocError> {
         initialize();
-        let mut r = Region::<()>::new_mmap(10).unwrap();
-        r.as_mut_vec().push(());
-        drop(r);
+        <Wrapper<()>>::allocate(10)?;
+        Ok(())
     }
 
     #[test]
-    fn test_zero_capacity_zst() {
+    fn test_zero_capacity_zst() -> Result<(), AllocError> {
         initialize();
-        Region::<()>::new_mmap(0).unwrap();
+        <Wrapper<()>>::allocate(0)?;
+        Ok(())
     }
 
     #[test]
-    fn test_zero_capacity_nonzst() {
+    fn test_zero_capacity_nonzst() -> Result<(), AllocError> {
         initialize();
-        Region::<u8>::new_mmap(0).unwrap();
+        <Wrapper<()>>::allocate(0)?;
+        Ok(())
     }
 
     #[test]
