@@ -1,32 +1,49 @@
 lgalloc
 =======
 
-This library provides a memory allocator for large objects.
+A memory allocator for large objects. Lgalloc stands for large (object) allocator.
+We spell it `lgalloc` and pronounce it el-gee-alloc.
 
 ```toml
 [dependencies]
-lgalloc = "0.1"
+lgalloc = "0.2"
 ```
 
 ## Example
 
 ```rust
-use lgalloc::Region;
+use std::mem::ManuallyDrop;
+fn main() -> Result<(), lgalloc::AllocError> {
+  lgalloc::lgalloc_set_config(
+    lgalloc::LgAlloc::new()
+      .enable()
+      .with_path(std::env::temp_dir()),
+  );
 
-fn main() {
-    // Create a 2MiB region
-    let mut region = Region::new_mmap(2 << 20);
-    region.extend_from_slice(&[1, 2, 3, 4]);
+  // Allocate memory
+  let (ptr, cap, handle) = lgalloc::allocate::<u8>(2 << 20)?;
+  // SAFETY: `allocate` returns a valid memory region and errors otherwise.
+  let mut vec = ManuallyDrop::new(unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, cap) });
+
+  // Write into region, make sure not to reallocate vector.
+  vec.extend_from_slice(&[1, 2, 3, 4]);
+
+  // We can read from the vector.
+  assert_eq!(&*vec, &[1, 2, 3, 4]);
+
+  // Deallocate after use
+  lgalloc::deallocate(handle);
+
+  Ok(())
 }
 ```
 
 ## Details
 
-- Lgalloc provides an allocator for power-of-two sized objects. Regions encapsulate objects
-  as a `Vec<T>`.
-- Although a region provides mutable access to a `Vec<T>`, the caller has to make sure that
-  the vector is never re-allocated, i.e., never push or extend with more data than the remaining
-  capacity.
+- Lgalloc provides an allocator for power-of-two sized memory regions.
+- The requested capacity can be rounded up to a larger capacity.
+- The memory can be repurposed, for example to back a vector, however, the caller needs to be
+  careful never to free the memory using the specific allocator.
 - Memory is not unmapped, but can be lazily marked as unused with a background thread. The exact
   options for this still need to be determined.
 - The allocations are mapped from a file, which allows the OS to page without using swap.
@@ -45,6 +62,7 @@ work-stealing pattern to move allocations between threads. Each size class acts 
 allocator.
 
 We use the term region for a power-of-two sized allocation, and area for a contiguous allocations.
+Each area can back multiple regions.
 
 * Each thread maintains a bounded cache of regions.
 * If on allocation the cache is empty, it checks the global pool first, and then other threads.
