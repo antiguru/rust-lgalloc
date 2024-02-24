@@ -38,6 +38,10 @@ use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use memmap2::MmapMut;
 use thiserror::Error;
 
+mod readme {
+    #![doc = include_str!("../README.md")]
+}
+
 /// Handle to describe allocations.
 ///
 /// Handles represent a leased allocation, which must be explicitly freed. Otherwise, the caller will permanently leak
@@ -115,7 +119,7 @@ impl Handle {
 /// The size of allocations to retain locally, per thread and size class.
 const LOCAL_BUFFER_BYTES: usize = 32 << 20;
 
-// Initial file size
+/// Initial file size
 const INITIAL_SIZE: usize = 32 << 20;
 
 /// Range of valid size classes.
@@ -155,6 +159,7 @@ pub enum AllocError {
 
 impl AllocError {
     /// Check if this error is [`AllocError::Disabled`].
+    #[must_use]
     pub fn is_disabled(&self) -> bool {
         matches!(self, AllocError::Disabled)
     }
@@ -169,12 +174,12 @@ impl SizeClass {
         Self(value)
     }
 
-    const fn index(&self) -> usize {
+    const fn index(self) -> usize {
         self.0 - VALID_SIZE_CLASS.start
     }
 
     /// The size in bytes of this size class.
-    const fn byte_size(&self) -> usize {
+    const fn byte_size(self) -> usize {
         1 << self.0
     }
 
@@ -272,8 +277,8 @@ impl GlobalStealer {
 
         Self {
             size_classes,
-            path: Default::default(),
-            background_sender: Default::default(),
+            path: RwLock::default(),
+            background_sender: Mutex::default(),
         }
     }
 }
@@ -348,6 +353,7 @@ struct LocalSizeClass {
     thread_id: ThreadId,
     /// Shared statistics maintained by this thread.
     stats: Arc<AllocStats>,
+    /// Phantom data to prevent sending the type across thread boundaries.
     _phantom: PhantomUnsyncUnsend<Self>,
 }
 
@@ -383,7 +389,7 @@ impl LocalSizeClass {
     /// the global state. As a last option, obtains memory from other workers.
     ///
     /// Returns [`AllcError::OutOfMemory`] if all pools are empty.
-    #[inline(always)]
+    #[inline]
     fn get(&self) -> Result<Handle, AllocError> {
         self.worker
             .pop()
@@ -424,10 +430,9 @@ impl LocalSizeClass {
         self.stats.allocations.fetch_add(1, Ordering::Relaxed);
         // Fast-path: Get non-blocking
         match self.get() {
-            Ok(mem) => Ok(mem),
             Err(AllocError::OutOfMemory) => {
                 self.stats.slow_path.fetch_add(1, Ordering::Relaxed);
-                // Get a a slow-path lock
+                // Get a slow-path lock
                 let _lock = self.size_class_state.lock.lock().unwrap();
                 // Try again because another thread might have refilled already
                 if let Ok(mem) = self.get() {
@@ -435,7 +440,7 @@ impl LocalSizeClass {
                 }
                 self.try_refill_and_get()
             }
-            e => e,
+            r => r,
         }
     }
 
@@ -554,6 +559,26 @@ fn thread_context<R, F: FnOnce(&mut ThreadLocalStealer) -> R>(f: F) -> R {
 /// otherwise. The capacity can be larger than requested.
 ///
 /// The memory must be freed using [`deallocate`], otherwise the memory leaks. The memory can be freed on a different thread.
+///
+/// # Errors
+///
+/// Allocate errors if the capacity cannot be supported by one of the size classes,
+/// the alignment requirements of `T` cannot be fulfilled, if no more memory can be
+/// obtained from the system, or if any syscall fails.
+///
+/// The function also returns an error if lgalloc is disabled.
+///
+/// In the case of an error, no memory is allocated, and we maintain the internal
+/// invariants of the allocator.
+///
+/// # Panics
+///
+/// The function can panic on internal errors, specifically when an allocation returned
+/// an unexpected size. In this case, the we do no maintain the allocator invariants
+/// and the caller should abort the process.
+///
+/// Panics if the thread local variable has been dropped, see [`std::thread::LocalKey`]
+/// for details.
 pub fn allocate<T>(capacity: usize) -> Result<(NonNull<T>, usize, Handle), AllocError> {
     if std::mem::size_of::<T>() == 0 {
         return Ok((NonNull::dangling(), usize::MAX, Handle::dangling()));
@@ -585,11 +610,16 @@ pub fn allocate<T>(capacity: usize) -> Result<(NonNull<T>, usize, Handle), Alloc
 ///
 /// This function cannot fail. The caller must not access the memory after freeing it. The caller is responsible
 /// for dropping/forgetting data.
+///
+/// # Panics
+///
+/// Panics if the thread local variable has been dropped, see [`std::thread::LocalKey`]
+/// for details.
 pub fn deallocate(handle: Handle) {
     if handle.is_dangling() {
         return;
     }
-    thread_context(|s| s.deallocate(handle))
+    thread_context(|s| s.deallocate(handle));
 }
 
 /// A background worker that performs periodic tasks.
@@ -619,11 +649,10 @@ impl BackgroundWorker {
     fn run(&mut self) {
         let mut next_cleanup: Option<Instant> = None;
         loop {
-            match self.receiver.recv_timeout(
-                next_cleanup
-                    .map(|next_cleanup| next_cleanup.saturating_duration_since(Instant::now()))
-                    .unwrap_or(Duration::MAX),
-            ) {
+            let timeout = next_cleanup.map_or(Duration::MAX, |next_cleanup| {
+                next_cleanup.saturating_duration_since(Instant::now())
+            });
+            match self.receiver.recv_timeout(timeout) {
                 Ok(config) => self.config = config,
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {
@@ -668,6 +697,10 @@ impl BackgroundWorker {
 ///
 /// Updating the background thread configuration eventually applies the new configuration on the
 /// running thread, or starts the background worker.
+///
+/// # Panics
+///
+/// Panics if the internal state of lgalloc is corrupted.
 pub fn lgalloc_set_config(config: &LgAlloc) {
     let stealer = GlobalStealer::get_static();
 
@@ -728,6 +761,7 @@ pub struct LgAlloc {
 
 impl LgAlloc {
     /// Construct a new configuration. All values are initialized to their default (None) values.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -887,7 +921,7 @@ mod numa_map {
         if let Some(page_size) = page_size {
             properties = properties
                 .into_iter()
-                .flat_map(|p| NumaMapProperty::normalize(p, page_size))
+                .filter_map(|p| NumaMapProperty::normalize(p, page_size))
                 .collect();
             properties.sort();
         }
@@ -956,6 +990,10 @@ mod numa_map {
 /// Determine global statistics per size class
 ///
 /// Note that this function take a read lock on various structures.
+///
+/// # Panics
+///
+/// Panics if the internal state of lgalloc is corrupted.
 pub fn lgalloc_stats(stats: &mut LgAllocStats) {
     stats.size_class.clear();
     stats.file_stats.clear();
@@ -1040,7 +1078,7 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
                 mapped,
                 active,
                 dirty,
-            })
+            });
         }
     }
 }
@@ -1100,7 +1138,7 @@ pub struct FileStats {
 
 #[cfg(test)]
 mod test {
-    use std::mem::MaybeUninit;
+    use std::mem::{ManuallyDrop, MaybeUninit};
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1151,6 +1189,26 @@ mod test {
         fn drop(&mut self) {
             unsafe { deallocate(self.handle.assume_init_read()) };
         }
+    }
+
+    #[test]
+    fn test_readme() -> Result<(), AllocError> {
+        initialize();
+
+        // Allocate memory
+        let (ptr, cap, handle) = allocate::<u8>(2 << 20)?;
+        // SAFETY: `allocate` returns a valid memory region and errors otherwise.
+        let mut vec = ManuallyDrop::new(unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, cap) });
+
+        // Write into region, make sure not to reallocate vector.
+        vec.extend_from_slice(&[1, 2, 3, 4]);
+
+        // We can read from the vector.
+        assert_eq!(&*vec, &[1, 2, 3, 4]);
+
+        // Deallocate after use
+        deallocate(handle);
+        Ok(())
     }
 
     #[test]
