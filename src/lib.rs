@@ -791,202 +791,6 @@ impl LgAlloc {
     }
 }
 
-/// Utilities to parse `numa_maps`, which only exists on Linux.
-mod numa_map {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-    use std::path::PathBuf;
-    use std::str::FromStr;
-
-    #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
-    enum NumaMapProperty {
-        File(PathBuf),
-        N(usize, usize),
-        Heap,
-        Stack,
-        Huge,
-        Anon(usize),
-        Dirty(usize),
-        Mapped(usize),
-        MapMax(usize),
-        SwapCache(usize),
-        Active(usize),
-        Writeback(usize),
-        KernelpagesizeKB(usize),
-    }
-
-    impl NumaMapProperty {
-        fn page_size(&self) -> Option<usize> {
-            match self {
-                NumaMapProperty::KernelpagesizeKB(page_size) => Some(*page_size),
-                _ => None,
-            }
-        }
-
-        fn normalize(self, page_size: usize) -> Option<NumaMapProperty> {
-            use NumaMapProperty::*;
-            match self {
-                File(p) => Some(File(p)),
-                N(node, pages) => Some(N(node, pages * page_size)),
-                Heap => Some(Heap),
-                Stack => Some(Stack),
-                Huge => Some(Huge),
-                Anon(pages) => Some(Anon(pages * page_size)),
-                Dirty(pages) => Some(Dirty(pages * page_size)),
-                Mapped(pages) => Some(Mapped(pages * page_size)),
-                MapMax(pages) => Some(MapMax(pages * page_size)),
-                SwapCache(pages) => Some(SwapCache(pages * page_size)),
-                Active(pages) => Some(Active(pages * page_size)),
-                Writeback(pages) => Some(Writeback(pages * page_size)),
-                KernelpagesizeKB(_) => None,
-            }
-        }
-    }
-
-    impl FromStr for NumaMapProperty {
-        type Err = String;
-
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let (key, val) = if let Some(index) = s.find('=') {
-                let (key, val) = s.split_at(index);
-                (key, Some(&val[1..]))
-            } else {
-                (s, None)
-            };
-            match (key, val) {
-                (key, Some(val)) if key.starts_with('N') => {
-                    let node = key[1..].parse().map_err(|e| format!("{e}"))?;
-                    let count = val.parse().map_err(|e| format!("{e}"))?;
-                    Ok(NumaMapProperty::N(node, count))
-                }
-                ("file", Some(val)) => Ok(NumaMapProperty::File(PathBuf::from(val))),
-                ("heap", _) => Ok(NumaMapProperty::Heap),
-                ("stack", _) => Ok(NumaMapProperty::Stack),
-                ("huge", _) => Ok(NumaMapProperty::Huge),
-                ("anon", Some(val)) => val
-                    .parse()
-                    .map(NumaMapProperty::Anon)
-                    .map_err(|e| format!("{e}")),
-                ("dirty", Some(val)) => val
-                    .parse()
-                    .map(NumaMapProperty::Dirty)
-                    .map_err(|e| format!("{e}")),
-                ("mapped", Some(val)) => val
-                    .parse()
-                    .map(NumaMapProperty::Mapped)
-                    .map_err(|e| format!("{e}")),
-                ("mapmax", Some(val)) => val
-                    .parse()
-                    .map(NumaMapProperty::MapMax)
-                    .map_err(|e| format!("{e}")),
-                ("swapcache", Some(val)) => val
-                    .parse()
-                    .map(NumaMapProperty::SwapCache)
-                    .map_err(|e| format!("{e}")),
-                ("active", Some(val)) => val
-                    .parse()
-                    .map(NumaMapProperty::Active)
-                    .map_err(|e| format!("{e}")),
-                ("writeback", Some(val)) => val
-                    .parse()
-                    .map(NumaMapProperty::Writeback)
-                    .map_err(|e| format!("{e}")),
-                ("kernelpagesize_kB", Some(val)) => val
-                    .parse()
-                    .map(|sz: usize| NumaMapProperty::KernelpagesizeKB(sz << 10))
-                    .map_err(|e| format!("{e}")),
-                (key, None) => Err(format!("unknown key: {key}")),
-                (key, Some(val)) => Err(format!("unknown key/value: {key}={val}")),
-            }
-        }
-    }
-
-    fn parse_numa_map(line: &str) -> Option<NumaMapEntry> {
-        let mut parts = line.split_whitespace();
-        let address = <usize>::from_str_radix(parts.next()?, 16).ok()?;
-        let _default = parts.next();
-        let mut properties = Vec::new();
-        let mut page_size = None;
-        for part in parts {
-            match part.parse::<NumaMapProperty>() {
-                Ok(property) => {
-                    if let Some(page_sz) = property.page_size() {
-                        page_size = Some(page_sz);
-                    }
-                    properties.push(property);
-                }
-                Err(err) => eprintln!("Failed to parse numa_map entry \"{part}\": {err}"),
-            }
-        }
-        if let Some(page_size) = page_size {
-            properties = properties
-                .into_iter()
-                .filter_map(|p| NumaMapProperty::normalize(p, page_size))
-                .collect();
-            properties.sort();
-        }
-        Some(NumaMapEntry {
-            properties,
-            address,
-        })
-    }
-
-    #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
-    struct NumaMapEntry {
-        address: usize,
-        properties: Vec<NumaMapProperty>,
-    }
-
-    #[derive(Default)]
-    pub(crate) struct NumaMap {
-        entries: Vec<NumaMapEntry>,
-    }
-
-    impl NumaMap {
-        pub(crate) fn read_numa_maps() -> std::io::Result<Self> {
-            let file = File::open("/proc/self/numa_maps")?;
-            let reader = BufReader::new(file);
-
-            let mut entries = Vec::new();
-            for line in reader.lines() {
-                if let Some(entry) = parse_numa_map(&(line?)) {
-                    entries.push(entry);
-                }
-            }
-            entries.sort_by_key(|entry| entry.address);
-            Ok(Self { entries })
-        }
-
-        /// Returns (mapped, active, dirty) in bytes. Substitutes zero values if not found.
-        pub(crate) fn get_stats(&self, base: usize) -> (usize, usize, usize) {
-            let entry = match self
-                .entries
-                .binary_search_by(|entry| entry.address.cmp(&base))
-            {
-                Ok(pos) => Some(&self.entries[pos]),
-                Err(_pos) => {
-                    // `numa_maps` only updates periodically, so we might be missing some
-                    // expected entries.
-                    None
-                }
-            };
-
-            let mut mapped = 0;
-            let mut active = 0;
-            let mut dirty = 0;
-            for property in entry.iter().flat_map(|e| e.properties.iter()) {
-                match property {
-                    NumaMapProperty::Dirty(d) => dirty = *d,
-                    NumaMapProperty::Mapped(m) => mapped = *m,
-                    NumaMapProperty::Active(a) => active = *a,
-                    _ => {}
-                }
-            }
-            (mapped, active, dirty)
-        }
-    }
-}
-
 /// Determine global statistics per size class
 ///
 /// Note that this function take a read lock on various structures.
@@ -1000,11 +804,17 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
 
     // `numa_maps` only exists on Linux, don't spam errors on other OSs.
     #[cfg(target_os = "linux")]
-    let numa_map = numa_map::NumaMap::read_numa_maps()
+    let mut numa_map = numa_maps::NumaMap::from_file("/proc/self/numa_maps")
         .map_err(|e| eprintln!("Failed to parse numa_maps: {e}"))
         .unwrap_or_default();
     #[cfg(not(target_os = "linux"))]
-    let numa_map = numa_map::NumaMap::read_numa_maps().unwrap_or_default();
+    let mut numa_map = numa_maps::NumaMap::default();
+
+    // Normalize numa_maps, and sort by address.
+    for entry in &mut numa_map.ranges {
+        entry.normalize();
+    }
+    numa_map.ranges.sort();
 
     let global = GlobalStealer::get_static();
 
@@ -1060,19 +870,52 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
         });
 
         for (file, mmap) in areas_lock.iter().map(ManuallyDrop::deref) {
-            let (mapped, active, dirty) = numa_map.get_stats(mmap.as_ptr().cast::<()>() as usize);
+            let (mapped, active, dirty) = {
+                let base = mmap.as_ptr().cast::<()>() as usize;
+                let range = match numa_map
+                    .ranges
+                    .binary_search_by(|range| range.address.cmp(&base))
+                {
+                    Ok(pos) => Some(&numa_map.ranges[pos]),
+                    // `numa_maps` only updates periodically, so we might be missing some
+                    // expected ranges.
+                    Err(_pos) => None,
+                };
 
-            let mut stat: MaybeUninit<libc::stat> = MaybeUninit::uninit();
-            let stat = unsafe {
-                libc::fstat(file.as_raw_fd(), stat.as_mut_ptr());
-                stat.assume_init_ref()
+                let mut mapped = 0;
+                let mut active = 0;
+                let mut dirty = 0;
+                for property in range.iter().flat_map(|e| e.properties.iter()) {
+                    match property {
+                        numa_maps::Property::Dirty(d) => dirty = *d,
+                        numa_maps::Property::Mapped(m) => mapped = *m,
+                        numa_maps::Property::Active(a) => active = *a,
+                        _ => {}
+                    }
+                }
+                (mapped, active, dirty)
             };
 
-            let blocks: usize = stat.st_blocks.try_into().unwrap();
+            let mut stat: MaybeUninit<libc::stat> = MaybeUninit::uninit();
+            // SAFETY: File descriptor valid, stat object valid.
+            let ret = unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) };
+            let stat = if ret == -1 {
+                None
+            } else {
+                // SAFETY: `stat` is initialized in the fstat non-error case.
+                Some(unsafe { stat.assume_init_ref() })
+            };
+
+            let (blocks, file_size) = stat.map_or((0, 0), |stat| {
+                (
+                    stat.st_blocks.try_into().unwrap_or(0),
+                    stat.st_size.try_into().unwrap_or(0),
+                )
+            });
 
             stats.file_stats.push(FileStats {
                 size_class,
-                file_size: stat.st_size.try_into().unwrap(),
+                file_size,
                 // Documented as multiples of 512
                 allocated_size: blocks * 512,
                 mapped,
