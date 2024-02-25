@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/antiguru/rust-lgalloc/compare/v0.2.0...v0.2.1) - 2024-02-25
+
+### Other
+- Extract numa_maps into separate crate
+- Update documentation
+
 ## [0.2.0](https://github.com/antiguru/rust-lgalloc/compare/v0.1.7...v0.2.0) - 2024-02-23
 
 ### Other
