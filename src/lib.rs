@@ -653,15 +653,18 @@ impl BackgroundWorker {
                 next_cleanup.saturating_duration_since(Instant::now())
             });
             match self.receiver.recv_timeout(timeout) {
-                Ok(config) => self.config = config,
+                Ok(config) => {
+                    self.config = config;
+                    next_cleanup = None;
+                }
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {
-                    next_cleanup = next_cleanup
-                        .unwrap_or_else(Instant::now)
-                        .checked_add(self.config.interval);
                     self.maintenance();
                 }
             }
+            next_cleanup = next_cleanup
+                .unwrap_or_else(Instant::now)
+                .checked_add(self.config.interval);
         }
     }
 
@@ -738,7 +741,7 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
 }
 
 /// Configuration for lgalloc's background worker.
-#[derive(Default, Clone, Eq, PartialEq)]
+#[derive(Default, Debug, Clone, Eq, PartialEq)]
 pub struct BackgroundWorkerConfig {
     /// How frequently it should tick
     pub interval: Duration,
