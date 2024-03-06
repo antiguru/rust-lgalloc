@@ -216,6 +216,8 @@ struct AllocStats {
     slow_path: AtomicU64,
     refill: AtomicU64,
     deallocations: AtomicU64,
+    clear_eager: AtomicU64,
+    clear_slow: AtomicU64,
 }
 
 /// Handle to the shared global state.
@@ -450,6 +452,7 @@ impl LocalSizeClass {
         self.stats.deallocations.fetch_add(1, Ordering::Relaxed);
         if self.worker.len() >= LOCAL_BUFFER_BYTES / self.size_class.byte_size() {
             if LGALLOC_EAGER_RETURN.load(Ordering::Relaxed) {
+                self.stats.clear_eager.fetch_add(1, Ordering::Relaxed);
                 mem.fast_clear().expect("clearing successful");
             }
             self.size_class_state.injector.push(mem);
@@ -484,7 +487,7 @@ impl LocalSizeClass {
         // Stash remaining in the injector.
         for ptr in chunks {
             self.size_class_state
-                .injector
+                .clean_injector
                 .push(Handle::new(ptr, self.size_class.byte_size()));
         }
 
@@ -529,22 +532,29 @@ impl Drop for LocalSizeClass {
             self.size_class_state.injector.push(mem);
         }
 
-        self.size_class_state.alloc_stats.allocations.fetch_add(
-            self.stats.allocations.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
+        let ordering = Ordering::Relaxed;
+
+        // Update global metrics by moving all worker-local metrics to global state.
+        self.size_class_state
+            .alloc_stats
+            .allocations
+            .fetch_add(self.stats.allocations.load(ordering), ordering);
         let global_stats = &self.size_class_state.alloc_stats;
         global_stats
             .refill
-            .fetch_add(self.stats.refill.load(Ordering::Relaxed), Ordering::Relaxed);
-        global_stats.slow_path.fetch_add(
-            self.stats.slow_path.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        global_stats.deallocations.fetch_add(
-            self.stats.deallocations.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
+            .fetch_add(self.stats.refill.load(ordering), ordering);
+        global_stats
+            .slow_path
+            .fetch_add(self.stats.slow_path.load(ordering), ordering);
+        global_stats
+            .deallocations
+            .fetch_add(self.stats.deallocations.load(ordering), ordering);
+        global_stats
+            .clear_slow
+            .fetch_add(self.stats.clear_slow.load(ordering), ordering);
+        global_stats
+            .clear_eager
+            .fetch_add(self.stats.clear_eager.load(ordering), ordering);
     }
 }
 
@@ -669,22 +679,32 @@ impl BackgroundWorker {
     }
 
     fn maintenance(&self) {
-        for size_class in &self.global_stealer.size_classes {
-            let _ = self.clear(size_class, &self.worker);
+        for (index, size_class_state) in self.global_stealer.size_classes.iter().enumerate() {
+            let size_class = SizeClass::from_index(index);
+            let count = self.clear(size_class, size_class_state, &self.worker);
+            size_class_state
+                .alloc_stats
+                .clear_slow
+                .fetch_add(count as u64, Ordering::Relaxed);
         }
     }
 
-    fn clear(&self, size_class: &SizeClassState, worker: &Worker<Handle>) -> usize {
-        let _ = size_class
-            .injector
-            .steal_batch_with_limit(worker, self.config.batch);
+    fn clear(
+        &self,
+        size_class: SizeClass,
+        state: &SizeClassState,
+        worker: &Worker<Handle>,
+    ) -> usize {
+        // Clear batch size, and at least one element.
+        let batch = (self.config.clear_bytes + size_class.byte_size() - 1) / size_class.byte_size();
+        let _ = state.injector.steal_batch_with_limit(worker, batch);
         let mut count = 0;
         while let Some(mut mem) = worker.pop() {
             match mem.clear() {
                 Ok(()) => count += 1,
                 Err(e) => panic!("Syscall failed: {e:?}"),
             }
-            size_class.clean_injector.push(mem);
+            state.clean_injector.push(mem);
         }
         count
     }
@@ -745,8 +765,8 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
 pub struct BackgroundWorkerConfig {
     /// How frequently it should tick
     pub interval: Duration,
-    /// How many allocations to clear per size class.
-    pub batch: usize,
+    /// How many bytes to clear per size class.
+    pub clear_bytes: usize,
 }
 
 /// Lgalloc configuration
@@ -841,6 +861,8 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
         let mut deallocations = 0;
         let mut refill = 0;
         let mut slow_path = 0;
+        let mut clear_eager_total = 0;
+        let mut clear_slow_total = 0;
         for thread_state in stealers.values() {
             thread_regions += thread_state.stealer.len();
             let thread_stats = &*thread_state.alloc_stats;
@@ -848,6 +870,8 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
             deallocations += thread_stats.deallocations.load(Ordering::Relaxed);
             refill += thread_stats.refill.load(Ordering::Relaxed);
             slow_path += thread_stats.slow_path.load(Ordering::Relaxed);
+            clear_eager_total += thread_stats.clear_eager.load(Ordering::Relaxed);
+            clear_slow_total += thread_stats.clear_slow.load(Ordering::Relaxed);
         }
 
         let free_regions = thread_regions + global_regions + clean_regions;
@@ -857,6 +881,8 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
         deallocations += global_stats.deallocations.load(Ordering::Relaxed);
         refill += global_stats.refill.load(Ordering::Relaxed);
         slow_path += global_stats.slow_path.load(Ordering::Relaxed);
+        clear_eager_total += global_stats.clear_eager.load(Ordering::Relaxed);
+        clear_slow_total += global_stats.clear_slow.load(Ordering::Relaxed);
 
         stats.size_class.push(SizeClassStats {
             size_class,
@@ -870,6 +896,8 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
             deallocations,
             refill,
             slow_path,
+            clear_eager_total,
+            clear_slow_total,
         });
 
         for (file, mmap) in areas_lock.iter().map(ManuallyDrop::deref) {
@@ -963,6 +991,10 @@ pub struct SizeClassStats {
     pub refill: u64,
     /// Total deallocations
     pub deallocations: u64,
+    /// Total times memory has been returned to the OS (eager reclamation) in regions.
+    pub clear_eager_total: u64,
+    /// Total times memory has been returned to the OS (slow reclamation) in regions.
+    pub clear_slow_total: u64,
 }
 
 /// Statistics per size class and backing file.
@@ -1003,7 +1035,7 @@ mod test {
                 .enable()
                 .with_background_config(BackgroundWorkerConfig {
                     interval: Duration::from_secs(1),
-                    batch: 32,
+                    clear_bytes: 4 << 20,
                 })
                 .with_path(std::env::temp_dir()),
         );
