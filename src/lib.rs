@@ -795,6 +795,12 @@ impl LgAlloc {
         self
     }
 
+    /// Disable lgalloc globally.
+    pub fn disable(&mut self) -> &mut Self {
+        self.enabled = Some(false);
+        self
+    }
+
     /// Set the background worker configuration.
     pub fn with_background_config(&mut self, config: BackgroundWorkerConfig) -> &mut Self {
         self.background_config = Some(config);
@@ -1224,5 +1230,12 @@ mod test {
         assert!(!stats.size_class.is_empty());
 
         Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_disable() {
+        crate::lgalloc_set_config(&*LgAlloc::new().disable());
+        assert!(matches!(allocate::<u8>(1024), Err(AllocError::Disabled)));
     }
 }
