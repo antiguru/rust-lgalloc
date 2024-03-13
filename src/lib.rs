@@ -696,15 +696,22 @@ impl BackgroundWorker {
         worker: &Worker<Handle>,
     ) -> usize {
         // Clear batch size, and at least one element.
-        let batch = (self.config.clear_bytes + size_class.byte_size() - 1) / size_class.byte_size();
-        let _ = state.injector.steal_batch_with_limit(worker, batch);
+        let byte_size = size_class.byte_size();
+        let mut limit = (self.config.clear_bytes + byte_size - 1) / byte_size;
         let mut count = 0;
-        while let Some(mut mem) = worker.pop() {
-            match mem.clear() {
-                Ok(()) => count += 1,
-                Err(e) => panic!("Syscall failed: {e:?}"),
+        let mut steal = Steal::Retry;
+        while limit > 0 && !steal.is_empty() {
+            steal = std::iter::repeat_with(|| state.injector.steal_batch_with_limit(worker, limit))
+                .find(|s| !s.is_retry())
+                .unwrap_or(Steal::Empty);
+            while let Some(mut mem) = worker.pop() {
+                match mem.clear() {
+                    Ok(()) => count += 1,
+                    Err(e) => panic!("Syscall failed: {e:?}"),
+                }
+                state.clean_injector.push(mem);
+                limit -= 1;
             }
-            state.clean_injector.push(mem);
         }
         count
     }
