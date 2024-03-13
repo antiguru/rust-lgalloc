@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/antiguru/rust-lgalloc/compare/v0.3.0...v0.3.1) - 2024-03-13
+
+### Other
+- Try harder to reclaim disk space
+- Only run tests on pull request and pushes to main
+- Add API to disable lgalloc globally
+
 ## [0.3.0](https://github.com/antiguru/rust-lgalloc/compare/v0.2.2...v0.3.0) - 2024-03-06
 
 ### Other
