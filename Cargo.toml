@@ -11,7 +11,7 @@ rust-version = "1.72"
 [dependencies]
 crossbeam-deque = "0.8.3"
 libc = "0.2"
-memmap2 = "0.5"
+memmap2 = { git = "https://github.com/antiguru/memmap2-rs", branch = "map_noreserve" }
 numa_maps = "0.1"
 page_size = "0.6.0"
 tempfile = "3"
