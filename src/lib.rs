@@ -1098,6 +1098,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_readme() -> Result<(), AllocError> {
         initialize();
 
@@ -1219,6 +1220,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_zst() -> Result<(), AllocError> {
         initialize();
         <Wrapper<()>>::allocate(10)?;
@@ -1226,6 +1228,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_zero_capacity_zst() -> Result<(), AllocError> {
         initialize();
         <Wrapper<()>>::allocate(0)?;
@@ -1233,6 +1236,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_zero_capacity_nonzst() -> Result<(), AllocError> {
         initialize();
         <Wrapper<()>>::allocate(0)?;
@@ -1240,6 +1244,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_stats() -> Result<(), AllocError> {
         initialize();
         let (_ptr, _cap, handle) = allocate::<usize>(1024)?;
