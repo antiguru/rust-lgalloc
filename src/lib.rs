@@ -31,11 +31,12 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::thread::{spawn, JoinHandle, ThreadId};
+use std::thread::{JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use memmap2::MmapMut;
+use numa_maps::NumaMap;
 use thiserror::Error;
 
 mod readme {
@@ -319,7 +320,7 @@ impl ThreadLocalStealer {
     ///
     /// Returns [`AllocError::Disabled`] if lgalloc is not enabled. Returns other error types
     /// if out of memory, or an internal operation fails.
-    fn allocate(&mut self, size_class: SizeClass) -> Result<Handle, AllocError> {
+    fn allocate(&self, size_class: SizeClass) -> Result<Handle, AllocError> {
         if !LGALLOC_ENABLED.load(Ordering::Relaxed) {
             return Err(AllocError::Disabled);
         }
@@ -559,8 +560,8 @@ impl Drop for LocalSizeClass {
 }
 
 /// Access the per-thread context.
-fn thread_context<R, F: FnOnce(&mut ThreadLocalStealer) -> R>(f: F) -> R {
-    WORKER.with(|cell| f(&mut cell.borrow_mut()))
+fn thread_context<R, F: FnOnce(&ThreadLocalStealer) -> R>(f: F) -> R {
+    WORKER.with(|cell| f(&cell.borrow()))
 }
 
 /// Allocate a memory area suitable to hold `capacity` consecutive elements of `T`.
@@ -685,7 +686,7 @@ impl BackgroundWorker {
             size_class_state
                 .alloc_stats
                 .clear_slow
-                .fetch_add(count as u64, Ordering::Relaxed);
+                .fetch_add(count.try_into().expect("must fit"), Ordering::Relaxed);
         }
     }
 
@@ -760,7 +761,7 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
         if let Some(config) = config {
             let (sender, receiver) = std::sync::mpsc::channel();
             let mut worker = BackgroundWorker::new(receiver);
-            let join_handle = spawn(move || worker.run());
+            let join_handle = std::thread::spawn(move || worker.run());
             sender.send(config).expect("Receiver exists");
             *lock = Some((join_handle, sender));
         }
@@ -834,25 +835,13 @@ impl LgAlloc {
 /// # Panics
 ///
 /// Panics if the internal state of lgalloc is corrupted.
-pub fn lgalloc_stats(stats: &mut LgAllocStats) {
-    stats.size_class.clear();
-    stats.file_stats.clear();
-
-    // `numa_maps` only exists on Linux, don't spam errors on other OSs.
-    #[cfg(target_os = "linux")]
-    let mut numa_map = numa_maps::NumaMap::from_file("/proc/self/numa_maps")
-        .map_err(|e| eprintln!("Failed to parse numa_maps: {e}"))
-        .unwrap_or_default();
-    #[cfg(not(target_os = "linux"))]
-    let mut numa_map = numa_maps::NumaMap::default();
-
-    // Normalize numa_maps, and sort by address.
-    for entry in &mut numa_map.ranges {
-        entry.normalize();
-    }
-    numa_map.ranges.sort();
+pub fn lgalloc_stats() -> LgAllocStats {
+    let mut numa_map = NumaMap::from_file("/proc/self/numa_maps");
 
     let global = GlobalStealer::get_static();
+
+    let mut size_classes = Vec::with_capacity(global.size_classes.len());
+    let mut file_stats = Vec::new();
 
     for (index, size_class_state) in global.size_classes.iter().enumerate() {
         let size_class = SizeClass::from_index(index);
@@ -897,7 +886,7 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
         clear_eager_total += global_stats.clear_eager.load(Ordering::Relaxed);
         clear_slow_total += global_stats.clear_slow.load(Ordering::Relaxed);
 
-        stats.size_class.push(SizeClassStats {
+        size_classes.push(SizeClassStats {
             size_class,
             areas,
             area_total_bytes,
@@ -913,70 +902,99 @@ pub fn lgalloc_stats(stats: &mut LgAllocStats) {
             clear_slow_total,
         });
 
-        for (file, mmap) in areas_lock.iter().map(ManuallyDrop::deref) {
-            let (mapped, active, dirty) = {
-                let base = mmap.as_ptr().cast::<()>() as usize;
-                let range = match numa_map
-                    .ranges
-                    .binary_search_by(|range| range.address.cmp(&base))
-                {
-                    Ok(pos) => Some(&numa_map.ranges[pos]),
-                    // `numa_maps` only updates periodically, so we might be missing some
-                    // expected ranges.
-                    Err(_pos) => None,
-                };
-
-                let mut mapped = 0;
-                let mut active = 0;
-                let mut dirty = 0;
-                for property in range.iter().flat_map(|e| e.properties.iter()) {
-                    match property {
-                        numa_maps::Property::Dirty(d) => dirty = *d,
-                        numa_maps::Property::Mapped(m) => mapped = *m,
-                        numa_maps::Property::Active(a) => active = *a,
-                        _ => {}
-                    }
-                }
-                (mapped, active, dirty)
-            };
-
-            let mut stat: MaybeUninit<libc::stat> = MaybeUninit::uninit();
-            // SAFETY: File descriptor valid, stat object valid.
-            let ret = unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) };
-            let stat = if ret == -1 {
-                None
-            } else {
-                // SAFETY: `stat` is initialized in the fstat non-error case.
-                Some(unsafe { stat.assume_init_ref() })
-            };
-
-            let (blocks, file_size) = stat.map_or((0, 0), |stat| {
-                (
-                    stat.st_blocks.try_into().unwrap_or(0),
-                    stat.st_size.try_into().unwrap_or(0),
-                )
-            });
-
-            stats.file_stats.push(FileStats {
+        if let Ok(numa_map) = numa_map.as_mut() {
+            let areas = &areas_lock[..];
+            file_stats.extend(extract_file_stats(
                 size_class,
-                file_size,
-                // Documented as multiples of 512
-                allocated_size: blocks * 512,
-                mapped,
-                active,
-                dirty,
-            });
+                numa_map,
+                areas.iter().map(Deref::deref),
+            ));
         }
+    }
+
+    LgAllocStats {
+        file_stats: match numa_map {
+            Ok(_) => Ok(file_stats),
+            Err(err) => Err(err),
+        },
+        size_class: size_classes,
     }
 }
 
+/// Extract for a size class area stats.
+fn extract_file_stats<'a>(
+    size_class: usize,
+    numa_map: &'a mut NumaMap,
+    areas: impl IntoIterator<Item = &'a (File, MmapMut)> + 'a,
+) -> impl Iterator<Item = FileStats> + 'a {
+    // Normalize numa_maps, and sort by address.
+    for entry in &mut numa_map.ranges {
+        entry.normalize();
+    }
+    numa_map.ranges.sort();
+
+    areas.into_iter().map(move |(file, mmap)| {
+        let (mapped, active, dirty) = {
+            let base = mmap.as_ptr().cast::<()>() as usize;
+            let range = match numa_map
+                .ranges
+                .binary_search_by(|range| range.address.cmp(&base))
+            {
+                Ok(pos) => Some(&numa_map.ranges[pos]),
+                // `numa_maps` only updates periodically, so we might be missing some
+                // expected ranges.
+                Err(_pos) => None,
+            };
+
+            let mut mapped = 0;
+            let mut active = 0;
+            let mut dirty = 0;
+            for property in range.iter().flat_map(|e| e.properties.iter()) {
+                match property {
+                    numa_maps::Property::Dirty(d) => dirty = *d,
+                    numa_maps::Property::Mapped(m) => mapped = *m,
+                    numa_maps::Property::Active(a) => active = *a,
+                    _ => {}
+                }
+            }
+            (mapped, active, dirty)
+        };
+
+        let mut stat: MaybeUninit<libc::stat> = MaybeUninit::uninit();
+        // SAFETY: File descriptor valid, stat object valid.
+        let ret = unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) };
+        let stat = if ret == -1 {
+            None
+        } else {
+            // SAFETY: `stat` is initialized in the fstat non-error case.
+            Some(unsafe { stat.assume_init_ref() })
+        };
+
+        let (blocks, file_size) = stat.map_or((0, 0), |stat| {
+            (
+                stat.st_blocks.try_into().unwrap_or(0),
+                stat.st_size.try_into().unwrap_or(0),
+            )
+        });
+        FileStats {
+            size_class,
+            file_size,
+            // Documented as multiples of 512
+            allocated_size: blocks * 512,
+            mapped,
+            active,
+            dirty,
+        }
+    })
+}
+
 /// Statistics about lgalloc's internal behavior.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LgAllocStats {
     /// Per size-class statistics.
     pub size_class: Vec<SizeClassStats>,
     /// Per size-class and backing file statistics.
-    pub file_stats: Vec<FileStats>,
+    pub file_stats: Result<Vec<FileStats>, std::io::Error>,
 }
 
 /// Statistics per size class.
@@ -1037,13 +1055,10 @@ mod test {
 
     use serial_test::serial;
 
-    use crate::{
-        allocate, deallocate, lgalloc_stats, AllocError, BackgroundWorkerConfig, Handle, LgAlloc,
-        LgAllocStats,
-    };
+    use super::*;
 
     fn initialize() {
-        crate::lgalloc_set_config(
+        lgalloc_set_config(
             LgAlloc::new()
                 .enable()
                 .with_background_config(BackgroundWorkerConfig {
@@ -1083,6 +1098,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_readme() -> Result<(), AllocError> {
         initialize();
 
@@ -1181,8 +1197,7 @@ mod test {
             handle.join().unwrap();
         }
         std::thread::sleep(Duration::from_secs(1));
-        let mut stats = Default::default();
-        crate::lgalloc_stats(&mut stats);
+        let stats = lgalloc_stats();
         println!("stats: {stats:?}");
         Ok(())
     }
@@ -1190,7 +1205,7 @@ mod test {
     #[test]
     #[serial]
     fn leak() -> Result<(), AllocError> {
-        crate::lgalloc_set_config(&crate::LgAlloc {
+        lgalloc_set_config(&LgAlloc {
             enabled: Some(true),
             path: Some(std::env::temp_dir()),
             background_config: None,
@@ -1205,6 +1220,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_zst() -> Result<(), AllocError> {
         initialize();
         <Wrapper<()>>::allocate(10)?;
@@ -1212,6 +1228,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_zero_capacity_zst() -> Result<(), AllocError> {
         initialize();
         <Wrapper<()>>::allocate(0)?;
@@ -1219,6 +1236,7 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_zero_capacity_nonzst() -> Result<(), AllocError> {
         initialize();
         <Wrapper<()>>::allocate(0)?;
@@ -1226,13 +1244,13 @@ mod test {
     }
 
     #[test]
+    #[serial]
     fn test_stats() -> Result<(), AllocError> {
         initialize();
         let (_ptr, _cap, handle) = allocate::<usize>(1024)?;
         deallocate(handle);
 
-        let mut stats = LgAllocStats::default();
-        lgalloc_stats(&mut stats);
+        let stats = lgalloc_stats();
 
         assert!(!stats.size_class.is_empty());
 
@@ -1242,7 +1260,7 @@ mod test {
     #[test]
     #[serial]
     fn test_disable() {
-        crate::lgalloc_set_config(&*LgAlloc::new().disable());
+        lgalloc_set_config(&*LgAlloc::new().disable());
         assert!(matches!(allocate::<u8>(1024), Err(AllocError::Disabled)));
     }
 }
