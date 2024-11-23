@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/antiguru/rust-lgalloc/compare/v0.3.1...v0.4.0) - 2024-11-23
+
+### Other
+
+- File stats wrapped in result ([#53](https://github.com/antiguru/rust-lgalloc/pull/53))
+
 ## [0.3.1](https://github.com/antiguru/rust-lgalloc/compare/v0.3.0...v0.3.1) - 2024-03-13
 
 ### Other
