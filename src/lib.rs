@@ -28,7 +28,7 @@ use std::ops::{Deref, Range};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{JoinHandle, ThreadId};
@@ -229,6 +229,12 @@ static LGALLOC_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable eager returning of memory. Off by default.
 static LGALLOC_EAGER_RETURN: AtomicBool = AtomicBool::new(false);
+
+/// Dampener in the file growth rate. 0 corresponds to doubling and in general `n` to `1+1/(n+1)`.
+///
+/// Setting this to 0 results in creating files with doubling capacity.
+/// Larger numbers result in more conservative approaches that create more files.
+static LGALLOC_FILE_GROWTH_DAMPENER: AtomicUsize = AtomicUsize::new(0);
 
 /// Type maintaining the global state for each size class.
 struct GlobalStealer {
@@ -469,12 +475,17 @@ impl LocalSizeClass {
         self.stats.refill.fetch_add(1, Ordering::Relaxed);
         let mut stash = self.size_class_state.areas.write().unwrap();
 
-        let byte_len = stash.iter().last().map_or_else(
-            || std::cmp::max(INITIAL_SIZE, self.size_class.byte_size()),
-            |mmap| mmap.1.len() * 2,
-        );
+        let initial_len = std::cmp::max(1, INITIAL_SIZE / self.size_class.byte_size());
 
-        let (file, mut mmap) = Self::init_file(byte_len)?;
+        let len = stash.iter().last().map_or(0, |mmap| mmap.1.len()) / self.size_class.byte_size();
+        let growth_dampener = LGALLOC_FILE_GROWTH_DAMPENER.load(Ordering::Relaxed);
+        // We would like to grow the file capacity by a factor of `1+1/(growth_dampener+1)`,
+        // but at least by `initial_len`.
+        let next_len = len + std::cmp::max(initial_len, len / (growth_dampener.saturating_add(1)));
+
+        let next_byte_len = next_len * self.size_class.byte_size();
+        let (file, mut mmap) = Self::init_file(next_byte_len)?;
+
         // SAFETY: Memory region initialized, so pointers to it are valid.
         let mut chunks = mmap
             .as_mut()
@@ -585,7 +596,7 @@ fn thread_context<R, F: FnOnce(&ThreadLocalStealer) -> R>(f: F) -> R {
 /// # Panics
 ///
 /// The function can panic on internal errors, specifically when an allocation returned
-/// an unexpected size. In this case, the we do no maintain the allocator invariants
+/// an unexpected size. In this case, we do not maintain the allocator invariants
 /// and the caller should abort the process.
 ///
 /// Panics if the thread local variable has been dropped, see [`std::thread::LocalKey`]
@@ -603,18 +614,17 @@ pub fn allocate<T>(capacity: usize) -> Result<(NonNull<T>, usize, Handle), Alloc
     // we only support powers-of-two sized regions.
     let size_class = SizeClass::from_byte_size(byte_len)?;
 
-    thread_context(|s| s.allocate(size_class)).and_then(|handle| {
-        debug_assert_eq!(handle.len(), size_class.byte_size());
-        let ptr: NonNull<T> = handle.as_non_null().cast();
-        // Memory region should be page-aligned, which we assume to be larger than any alignment
-        // we might encounter. If this is not the case, bail out.
-        if ptr.as_ptr().align_offset(std::mem::align_of::<T>()) != 0 {
-            thread_context(move |s| s.deallocate(handle));
-            return Err(AllocError::UnalignedMemory);
-        }
-        let actual_capacity = handle.len() / std::mem::size_of::<T>();
-        Ok((ptr, actual_capacity, handle))
-    })
+    let handle = thread_context(|s| s.allocate(size_class))?;
+    debug_assert_eq!(handle.len(), size_class.byte_size());
+    let ptr: NonNull<T> = handle.as_non_null().cast();
+    // Memory region should be page-aligned, which we assume to be larger than any alignment
+    // we might encounter. If this is not the case, bail out.
+    if ptr.as_ptr().align_offset(std::mem::align_of::<T>()) != 0 {
+        thread_context(move |s| s.deallocate(handle));
+        return Err(AllocError::UnalignedMemory);
+    }
+    let actual_capacity = handle.len() / std::mem::size_of::<T>();
+    Ok((ptr, actual_capacity, handle))
 }
 
 /// Free the memory referenced by `handle`, which has been obtained from [`allocate`].
@@ -747,6 +757,10 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
         *stealer.path.write().unwrap() = Some(path.clone());
     }
 
+    if let Some(file_growth_dampener) = &config.file_growth_dampener {
+        LGALLOC_FILE_GROWTH_DAMPENER.store(*file_growth_dampener, Ordering::Relaxed);
+    }
+
     if let Some(config) = config.background_config.clone() {
         let mut lock = stealer.background_sender.lock().unwrap();
 
@@ -788,6 +802,8 @@ pub struct LgAlloc {
     pub background_config: Option<BackgroundWorkerConfig>,
     /// Whether to return physical memory on deallocate
     pub eager_return: Option<bool>,
+    /// Dampener in the file growth rate. 0 corresponds to doubling and in general `n` to `1+1/(n+1)`.
+    pub file_growth_dampener: Option<usize>,
 }
 
 impl LgAlloc {
@@ -824,6 +840,12 @@ impl LgAlloc {
     /// Enable eager memory reclamation.
     pub fn eager_return(&mut self, eager_return: bool) -> &mut Self {
         self.eager_return = Some(eager_return);
+        self
+    }
+
+    /// Set the file growth dampener.
+    pub fn file_growth_dampener(&mut self, file_growth_dapener: usize) -> &mut Self {
+        self.file_growth_dampener = Some(file_growth_dapener);
         self
     }
 }
@@ -1065,7 +1087,8 @@ mod test {
                     interval: Duration::from_secs(1),
                     clear_bytes: 4 << 20,
                 })
-                .with_path(std::env::temp_dir()),
+                .with_path(std::env::temp_dir())
+                .file_growth_dampener(1),
         );
     }
 
@@ -1198,7 +1221,17 @@ mod test {
         }
         std::thread::sleep(Duration::from_secs(1));
         let stats = lgalloc_stats();
-        println!("stats: {stats:?}");
+        for size_class in &stats.size_class {
+            println!("size_class {:?}", size_class);
+        }
+        match stats.file_stats {
+            Ok(file_stats) => {
+                for file_stats in file_stats {
+                    println!("file_stats {:?}", file_stats);
+                }
+            }
+            Err(e) => eprintln!("error: {e}"),
+        }
         Ok(())
     }
 
@@ -1210,6 +1243,7 @@ mod test {
             path: Some(std::env::temp_dir()),
             background_config: None,
             eager_return: None,
+            file_growth_dampener: None,
         });
         let r = <Wrapper<u8>>::allocate(1000)?;
 

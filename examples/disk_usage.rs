@@ -8,6 +8,7 @@ fn main() {
     config.enable();
     config.eager_return(true);
     config.with_path(std::env::temp_dir());
+    config.file_growth_dampener(2);
     lgalloc::lgalloc_set_config(&config);
 
     println!("Allocating {buffers} regions of {buffer_size} size...");
