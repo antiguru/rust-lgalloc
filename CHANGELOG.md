@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/antiguru/rust-lgalloc/compare/v0.4.0...v0.5.0) - 2025-02-27
+
+### Other
+
+- Configurable local buffer size ([#60](https://github.com/antiguru/rust-lgalloc/pull/60))
+- Assign thread name to background worker ([#58](https://github.com/antiguru/rust-lgalloc/pull/58))
+- File growth dampener ([#57](https://github.com/antiguru/rust-lgalloc/pull/57))
+
 ## [0.4.0](https://github.com/antiguru/rust-lgalloc/compare/v0.3.1...v0.4.0) - 2024-11-23
 
 ### Other
