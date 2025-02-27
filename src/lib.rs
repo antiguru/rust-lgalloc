@@ -780,7 +780,10 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
         if let Some(config) = config {
             let (sender, receiver) = std::sync::mpsc::channel();
             let mut worker = BackgroundWorker::new(receiver);
-            let join_handle = std::thread::spawn(move || worker.run());
+            let join_handle = std::thread::Builder::new()
+                .name("lgalloc-0".to_string())
+                .spawn(move || worker.run())
+                .expect("thread started successfully");
             sender.send(config).expect("Receiver exists");
             *lock = Some((join_handle, sender));
         }
