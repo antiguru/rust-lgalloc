@@ -40,10 +40,10 @@ fn main() -> Result<(), lgalloc::AllocError> {
 
 ## Details
 
-- Lgalloc provides an allocator for power-of-two sized memory regions.
+- Lgalloc provides an allocator for power-of-two sized memory regions, with an optional dampener.
 - The requested capacity can be rounded up to a larger capacity.
 - The memory can be repurposed, for example to back a vector, however, the caller needs to be
-  careful never to free the memory using the specific allocator.
+  careful never to free the memory using another allocator.
 - Memory is not unmapped, but can be lazily marked as unused with a background thread. The exact
   options for this still need to be determined.
 - The allocations are mapped from a file, which allows the OS to page without using swap.
@@ -51,7 +51,8 @@ fn main() -> Result<(), lgalloc::AllocError> {
   with huge pages.
 - The library does not consume physical memory when all regions are freed, but pollutes the
   virtual address space because it doesn't unmap regions. This is because the library does
-  not keep track what parts of a mapping are still in use.
+  not keep track what parts of a mapping are still in use. (Its internal structures always
+  require memory.)
 - Generally, use at your own risk because nobody should write a memory allocator.
 - Performance seems to be reasonable, similar to the system allocator when not touching the data,
   and faster when touching the data. The reason is that this library does not unmap its regions.
@@ -59,7 +60,8 @@ fn main() -> Result<(), lgalloc::AllocError> {
 
 The allocator tries to minimize contention. It relies on thread-local allocations and a
 work-stealing pattern to move allocations between threads. Each size class acts as its own
-allocator.
+allocator. However, some system calls can contend on mapping objects, which is why reclamation
+and gathering stats can cause contention.
 
 We use the term region for a power-of-two sized allocation, and area for a contiguous allocations.
 Each area can back multiple regions.
@@ -72,7 +74,8 @@ Each area can back multiple regions.
 * Lgalloc makes heavy use of `crossbeam-deque`, which provides a lock-free work stealing API.
 * Refilling areas is a synchronous operation. It requires to create a file, allocate space, and
   map its contents. We double the size of the allocation each time a size class is empty.
-* Lgalloc reports metrics about allocations, deallocations, and refills.
+* Lgalloc reports metrics about allocations, deallocations, and refills, and about the files it
+  owns, if the platform supports it.
 
 ## To do
 

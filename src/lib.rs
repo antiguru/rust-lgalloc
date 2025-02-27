@@ -475,15 +475,20 @@ impl LocalSizeClass {
         self.stats.refill.fetch_add(1, Ordering::Relaxed);
         let mut stash = self.size_class_state.areas.write().unwrap();
 
-        let initial_len = std::cmp::max(1, INITIAL_SIZE / self.size_class.byte_size());
+        let initial_capacity = std::cmp::max(1, INITIAL_SIZE / self.size_class.byte_size());
 
-        let len = stash.iter().last().map_or(0, |mmap| mmap.1.len()) / self.size_class.byte_size();
+        let last_capacity =
+            stash.iter().last().map_or(0, |mmap| mmap.1.len()) / self.size_class.byte_size();
         let growth_dampener = LGALLOC_FILE_GROWTH_DAMPENER.load(Ordering::Relaxed);
         // We would like to grow the file capacity by a factor of `1+1/(growth_dampener+1)`,
-        // but at least by `initial_len`.
-        let next_len = len + std::cmp::max(initial_len, len / (growth_dampener.saturating_add(1)));
+        // but at least by `initial_capacity`.
+        let next_capacity = last_capacity
+            + std::cmp::max(
+                initial_capacity,
+                last_capacity / (growth_dampener.saturating_add(1)),
+            );
 
-        let next_byte_len = next_len * self.size_class.byte_size();
+        let next_byte_len = next_capacity * self.size_class.byte_size();
         let (file, mut mmap) = Self::init_file(next_byte_len)?;
 
         // SAFETY: Memory region initialized, so pointers to it are valid.
