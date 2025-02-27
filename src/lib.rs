@@ -117,9 +117,6 @@ impl Handle {
     }
 }
 
-/// The size of allocations to retain locally, per thread and size class.
-const LOCAL_BUFFER_BYTES: usize = 32 << 20;
-
 /// Initial file size
 const INITIAL_SIZE: usize = 32 << 20;
 
@@ -235,6 +232,9 @@ static LGALLOC_EAGER_RETURN: AtomicBool = AtomicBool::new(false);
 /// Setting this to 0 results in creating files with doubling capacity.
 /// Larger numbers result in more conservative approaches that create more files.
 static LGALLOC_FILE_GROWTH_DAMPENER: AtomicUsize = AtomicUsize::new(0);
+
+/// The size of allocations to retain locally, per thread and size class.
+static LOCAL_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(32 << 20);
 
 /// Type maintaining the global state for each size class.
 struct GlobalStealer {
@@ -408,7 +408,11 @@ impl LocalSizeClass {
                     // 1. Memory from the global state,
                     // 2. Memory from the global cleaned state,
                     // 3. Memory from other threads.
-                    let limit = 1.max(LOCAL_BUFFER_BYTES / self.size_class.byte_size() / 2);
+                    let limit = 1.max(
+                        LOCAL_BUFFER_BYTES.load(Ordering::Relaxed)
+                            / self.size_class.byte_size()
+                            / 2,
+                    );
 
                     self.size_class_state
                         .injector
@@ -457,7 +461,9 @@ impl LocalSizeClass {
     fn push(&self, mut mem: Handle) {
         debug_assert_eq!(mem.len(), self.size_class.byte_size());
         self.stats.deallocations.fetch_add(1, Ordering::Relaxed);
-        if self.worker.len() >= LOCAL_BUFFER_BYTES / self.size_class.byte_size() {
+        if self.worker.len()
+            >= LOCAL_BUFFER_BYTES.load(Ordering::Relaxed) / self.size_class.byte_size()
+        {
             if LGALLOC_EAGER_RETURN.load(Ordering::Relaxed) {
                 self.stats.clear_eager.fetch_add(1, Ordering::Relaxed);
                 mem.fast_clear().expect("clearing successful");
@@ -766,6 +772,10 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
         LGALLOC_FILE_GROWTH_DAMPENER.store(*file_growth_dampener, Ordering::Relaxed);
     }
 
+    if let Some(local_buffer_bytes) = &config.local_buffer_bytes {
+        LOCAL_BUFFER_BYTES.store(*local_buffer_bytes, Ordering::Relaxed);
+    }
+
     if let Some(config) = config.background_config.clone() {
         let mut lock = stealer.background_sender.lock().unwrap();
 
@@ -812,6 +822,8 @@ pub struct LgAlloc {
     pub eager_return: Option<bool>,
     /// Dampener in the file growth rate. 0 corresponds to doubling and in general `n` to `1+1/(n+1)`.
     pub file_growth_dampener: Option<usize>,
+    /// Size of the per-thread per-size class cache, in bytes.
+    pub local_buffer_bytes: Option<usize>,
 }
 
 impl LgAlloc {
@@ -854,6 +866,12 @@ impl LgAlloc {
     /// Set the file growth dampener.
     pub fn file_growth_dampener(&mut self, file_growth_dapener: usize) -> &mut Self {
         self.file_growth_dampener = Some(file_growth_dapener);
+        self
+    }
+
+    /// Set the local buffer size.
+    pub fn local_buffer_bytes(&mut self, local_buffer_bytes: usize) -> &mut Self {
+        self.local_buffer_bytes = Some(local_buffer_bytes);
         self
     }
 }
@@ -1249,9 +1267,7 @@ mod test {
         lgalloc_set_config(&LgAlloc {
             enabled: Some(true),
             path: Some(std::env::temp_dir()),
-            background_config: None,
-            eager_return: None,
-            file_growth_dampener: None,
+            ..Default::default()
         });
         let r = <Wrapper<u8>>::allocate(1000)?;
 
