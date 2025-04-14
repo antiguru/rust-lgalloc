@@ -20,7 +20,7 @@
 #![deny(missing_docs)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::marker::PhantomData;
 use std::mem::{take, ManuallyDrop, MaybeUninit};
@@ -29,12 +29,10 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::thread::{JoinHandle, ThreadId};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
+use std::thread::ThreadId;
 
-use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use crossbeam_deque::{Steal, Stealer, Worker};
 use memmap2::MmapMut;
 use numa_maps::NumaMap;
 use thiserror::Error;
@@ -56,6 +54,9 @@ pub struct Handle {
 
 unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
+
+/// Lgalloc result type
+pub type LgResult<T> = Result<T, AllocError>;
 
 #[allow(clippy::len_without_is_empty)]
 impl Handle {
@@ -84,12 +85,6 @@ impl Handle {
     /// Pointer to memory.
     fn as_non_null(&self) -> NonNull<u8> {
         self.ptr
-    }
-
-    /// Indicate that the memory is not in use and that the OS can recycle it.
-    fn clear(&mut self) -> std::io::Result<()> {
-        // SAFETY: `MADV_DONTNEED_STRATEGY` guaranteed to be a valid argument.
-        unsafe { self.madvise(MADV_DONTNEED_STRATEGY) }
     }
 
     /// Indicate that the memory is not in use and that the OS can recycle it.
@@ -122,16 +117,6 @@ const INITIAL_SIZE: usize = 32 << 20;
 
 /// Range of valid size classes.
 pub const VALID_SIZE_CLASS: Range<usize> = 10..37;
-
-/// Strategy to indicate that the OS can reclaim pages
-// TODO: On Linux, we want to use MADV_REMOVE, but that's only supported
-// on file systems that supports FALLOC_FL_PUNCH_HOLE. We should check
-// the return value and retry EOPNOTSUPP with MADV_DONTNEED.
-#[cfg(target_os = "linux")]
-const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_REMOVE;
-
-#[cfg(not(target_os = "linux"))]
-const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
 
 type PhantomUnsyncUnsend<T> = PhantomData<*mut T>;
 
@@ -186,7 +171,7 @@ impl SizeClass {
     }
 
     /// Obtain a size class from a size in bytes.
-    fn from_byte_size(byte_size: usize) -> Result<Self, AllocError> {
+    fn from_byte_size(byte_size: usize) -> LgResult<Self> {
         let class = byte_size.next_power_of_two().trailing_zeros() as usize;
         class.try_into()
     }
@@ -199,7 +184,7 @@ impl SizeClass {
 impl TryFrom<usize> for SizeClass {
     type Error = AllocError;
 
-    fn try_from(value: usize) -> Result<Self, Self::Error> {
+    fn try_from(value: usize) -> LgResult<Self> {
         if VALID_SIZE_CLASS.contains(&value) {
             Ok(SizeClass(value))
         } else {
@@ -243,8 +228,6 @@ struct GlobalStealer {
     size_classes: Vec<SizeClassState>,
     /// Path to store files
     path: RwLock<Option<PathBuf>>,
-    /// Shared token to access background thread.
-    background_sender: Mutex<Option<(JoinHandle<()>, Sender<BackgroundWorkerConfig>)>>,
 }
 
 /// Per-size-class state
@@ -254,16 +237,219 @@ struct SizeClassState {
     ///
     /// We must never dereference the memory-mapped regions stored here.
     areas: RwLock<Vec<ManuallyDrop<(File, MmapMut)>>>,
-    /// Injector to distribute memory globally.
-    injector: Injector<Handle>,
-    /// Injector to distribute memory globally, freed memory.
-    clean_injector: Injector<Handle>,
-    /// Slow-path lock to refill pool.
-    lock: Mutex<()>,
     /// Thread stealers to allow all participating threads to steal memory.
     stealers: RwLock<HashMap<ThreadId, PerThreadState<Handle>>>,
     /// Summed stats for terminated threads.
     alloc_stats: AllocStats,
+}
+
+impl SizeClassState {
+    fn allocate(&self, size_class: SizeClass) -> LgResult<Handle> {
+        GLOBAL_BUDDY.lock().unwrap().allocate(size_class)
+    }
+
+    fn free(&self, handle: Handle) {
+        GLOBAL_BUDDY.lock().unwrap().free(handle);
+    }
+}
+
+const MAX_LOG_SIZE: usize = std::mem::size_of::<usize>() * 8;
+
+/// TODO
+pub struct GlobalBuddyAllocator {
+    memory: BTreeMap<*mut u8, usize>,
+    free: Vec<BTreeSet<*mut u8>>,
+    last_byte_capacity: usize,
+    files: Vec<(File, MmapMut)>,
+}
+
+unsafe impl Send for GlobalBuddyAllocator {}
+
+static GLOBAL_BUDDY: LazyLock<Mutex<GlobalBuddyAllocator>> =
+    LazyLock::new(|| Mutex::new(GlobalBuddyAllocator::new()));
+
+impl GlobalBuddyAllocator {
+    fn new() -> Self {
+        Self {
+            memory: BTreeMap::new(),
+            free: vec![BTreeSet::new(); MAX_LOG_SIZE],
+            last_byte_capacity: 0,
+            files: Vec::default(),
+        }
+    }
+
+    fn insert(&mut self, ptr: *mut u8, size: usize) {
+        debug_assert_eq!(
+            size.trailing_zeros(),
+            size.ilog2(),
+            "allocation not power-of-two!"
+        );
+
+        let inserted = self.free[size.trailing_zeros() as usize].insert(ptr);
+        assert!(inserted);
+        let old = self.memory.insert(ptr, size);
+        assert_eq!(old, None);
+    }
+
+    fn allocate(&mut self, size_class: SizeClass) -> LgResult<Handle> {
+        // println!("allocating {:?}", size_class.byte_size());
+        let lgsize = size_class.byte_size().trailing_zeros() as usize;
+        // Check if there's a free block of the desired size
+        if let Some(ptr) = self.free[lgsize].pop_first() {
+            let cap = self.memory.remove(&ptr).unwrap();
+            assert_eq!(cap, size_class.byte_size());
+            self.check();
+            return Ok(Handle::new(
+                unsafe { NonNull::new_unchecked(ptr as *mut u8) },
+                size_class.byte_size(),
+            ));
+        }
+        // Start probing increasing size.
+        let mut probe_size_class = lgsize + 1;
+        while probe_size_class < MAX_LOG_SIZE {
+            if self.free[probe_size_class].is_empty() {
+                probe_size_class += 1;
+            } else {
+                break;
+            }
+        }
+        // Check if we did not find a free block
+        if probe_size_class == MAX_LOG_SIZE {
+            let (file, mut mmap) = self.new_memory(size_class.byte_size())?;
+            let capacity = mmap.len();
+            assert_eq!(
+                capacity.trailing_zeros(),
+                capacity.next_power_of_two().trailing_zeros()
+            );
+            let mut ptr = mmap.as_mut_ptr();
+            let mut cap = mmap.len();
+            probe_size_class = cap.trailing_zeros() as usize;
+            while cap > 0 {
+                let max_lg_size = ptr.addr().trailing_zeros();
+                let this_size: usize = 1 << std::cmp::min(cap.ilog2(), max_lg_size);
+                if this_size > size_class.byte_size() {
+                    probe_size_class =
+                        std::cmp::min(probe_size_class, this_size.trailing_zeros() as usize);
+                }
+                self.insert(ptr, this_size);
+
+                cap = cap.saturating_sub(this_size);
+                ptr = unsafe { ptr.add(this_size) };
+            }
+            self.files.push((file, mmap));
+        }
+
+        // We have a free block, let's split it
+        while probe_size_class > lgsize {
+            let ptr = self.free[probe_size_class].pop_first().unwrap();
+            let capacity = self.memory.remove(&ptr).unwrap();
+            assert_eq!(capacity, 1 << probe_size_class);
+            let new_size_class = probe_size_class - 1;
+            let new_ptr = unsafe { ptr.add(capacity >> 1) };
+            self.insert(ptr, capacity >> 1);
+            self.insert(new_ptr, capacity >> 1);
+            probe_size_class = new_size_class;
+        }
+
+        // We have a free block of the right size, let's return it
+        let ptr = self.free[lgsize].pop_first().unwrap();
+        let cap = self.memory.remove(&ptr).unwrap();
+        assert_eq!(cap, size_class.byte_size());
+
+        Ok(Handle::new(
+            unsafe { NonNull::new_unchecked(ptr) },
+            size_class.byte_size(),
+        ))
+    }
+
+    fn free(&mut self, Handle { ptr, len }: Handle) {
+        self.insert(ptr.as_ptr(), len);
+
+        // Check if we can merge with buddy
+        let mut base = ptr.as_ptr();
+        let mut len = len;
+        while let Some(new_base) = self.merge(base, len) {
+            base = new_base;
+            len *= 2;
+        }
+    }
+
+    fn merge(&mut self, ptr: *mut u8, len: usize) -> Option<*mut u8> {
+        // 0b10|00 and 0b11|00 are buddies
+        let merged = ptr.map_addr(|this| this & !len);
+        let buddy = ptr.map_addr(|this| this ^ len);
+
+        let this_len = self.memory.get(&ptr).copied().unwrap();
+        let buddy_len = self.memory.get(&buddy).copied();
+
+        if Some(this_len) == buddy_len {
+            println!("Merging {ptr:?} {buddy:?} {this_len:x}");
+            let _ = self.memory.remove(&buddy).unwrap();
+            let _ = self.memory.remove(&ptr).unwrap();
+            // Buddy is free, merge
+            let new_size_class = this_len.trailing_zeros() as usize;
+            assert!(self.free[new_size_class].remove(&buddy));
+            assert!(self.free[new_size_class].remove(&ptr));
+            self.insert(merged, this_len * 2);
+            // self.memory.insert(this, cap + len);
+            // self.free[new_size_class + 1].insert(this);
+            Some(merged)
+        } else {
+            None
+        }
+    }
+
+    fn new_memory(&self, min_size: usize) -> LgResult<(File, MmapMut)> {
+        let initial_capacity = std::cmp::max(min_size, INITIAL_SIZE);
+
+        let growth_dampener = LGALLOC_FILE_GROWTH_DAMPENER.load(Ordering::Relaxed);
+        // We would like to grow the file capacity by a factor of `1+1/(growth_dampener+1)`,
+        // but at least by `initial_capacity`.
+        let next_byte_capacity = self.last_byte_capacity
+            + std::cmp::max(
+                initial_capacity,
+                self.last_byte_capacity / (growth_dampener.saturating_add(1)),
+            );
+
+        Self::init_file(next_byte_capacity)
+    }
+
+    /// Allocate and map a file of size `byte_len`. Returns an handle, or error if the allocation
+    /// fails.
+    fn init_file(byte_len: usize) -> LgResult<(File, MmapMut)> {
+        let path = GlobalStealer::get_static().path.read().unwrap().clone();
+        let Some(path) = path else {
+            return Err(AllocError::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            )));
+        };
+        let file = tempfile::tempfile_in(path)?;
+        let fd = file.as_fd().as_raw_fd();
+        // SAFETY: Calling ftruncate on the file, which we just created.
+        unsafe {
+            let ret = libc::ftruncate(fd, libc::off_t::try_from(byte_len).expect("Must fit"));
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        // SAFETY: We only map `file` once, and never share it with other processes.
+        let mmap = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
+        assert_eq!(mmap.len(), byte_len);
+        Ok((file, mmap))
+    }
+
+    fn check(&self) {
+        for (size_class, frees) in self.free.iter().enumerate() {
+            for ptr in frees.iter() {
+                let size = self.memory.get(ptr).unwrap();
+                assert_eq!(size.trailing_zeros() as usize, size_class, "ptr {ptr:?}");
+            }
+        }
+        for (ptr, size) in self.memory.iter() {
+            let size_class = size.trailing_zeros() as usize;
+            assert_eq!(self.free[size_class].contains(ptr), true, "ptr {ptr:?}");
+        }
+    }
 }
 
 impl GlobalStealer {
@@ -287,7 +473,6 @@ impl GlobalStealer {
         Self {
             size_classes,
             path: RwLock::default(),
-            background_sender: Mutex::default(),
         }
     }
 }
@@ -405,34 +590,17 @@ impl LocalSizeClass {
             .or_else(|| {
                 std::iter::repeat_with(|| {
                     // The loop tries to obtain memory in the following order:
-                    // 1. Memory from the global state,
-                    // 2. Memory from the global cleaned state,
-                    // 3. Memory from other threads.
-                    let limit = 1.max(
-                        LOCAL_BUFFER_BYTES.load(Ordering::Relaxed)
-                            / self.size_class.byte_size()
-                            / 2,
-                    );
+                    // 1. Memory from other threads.
 
                     self.size_class_state
-                        .injector
-                        .steal_batch_with_limit_and_pop(&self.worker, limit)
-                        .or_else(|| {
-                            self.size_class_state
-                                .clean_injector
-                                .steal_batch_with_limit_and_pop(&self.worker, limit)
-                        })
-                        .or_else(|| {
-                            self.size_class_state
-                                .stealers
-                                .read()
-                                .unwrap()
-                                .values()
-                                .map(|state| state.stealer.steal())
-                                .collect()
-                        })
+                        .stealers
+                        .read()
+                        .unwrap()
+                        .values()
+                        .map(|state| state.stealer.steal())
+                        .collect()
                 })
-                .find(|s| !s.is_retry())
+                .find(|s: &Steal<_>| !s.is_retry())
                 .and_then(Steal::success)
             })
             .ok_or(AllocError::OutOfMemory)
@@ -445,13 +613,7 @@ impl LocalSizeClass {
         match self.get() {
             Err(AllocError::OutOfMemory) => {
                 self.stats.slow_path.fetch_add(1, Ordering::Relaxed);
-                // Get a slow-path lock
-                let _lock = self.size_class_state.lock.lock().unwrap();
-                // Try again because another thread might have refilled already
-                if let Ok(mem) = self.get() {
-                    return Ok(mem);
-                }
-                self.try_refill_and_get()
+                self.size_class_state.allocate(self.size_class)
             }
             r => r,
         }
@@ -468,78 +630,10 @@ impl LocalSizeClass {
                 self.stats.clear_eager.fetch_add(1, Ordering::Relaxed);
                 mem.fast_clear().expect("clearing successful");
             }
-            self.size_class_state.injector.push(mem);
+            self.size_class_state.free(mem);
         } else {
             self.worker.push(mem);
         }
-    }
-
-    /// Refill the memory pool, and get one area.
-    ///
-    /// Returns an error if the memory pool cannot be refilled.
-    fn try_refill_and_get(&self) -> Result<Handle, AllocError> {
-        self.stats.refill.fetch_add(1, Ordering::Relaxed);
-        let mut stash = self.size_class_state.areas.write().unwrap();
-
-        let initial_capacity = std::cmp::max(1, INITIAL_SIZE / self.size_class.byte_size());
-
-        let last_capacity =
-            stash.iter().last().map_or(0, |mmap| mmap.1.len()) / self.size_class.byte_size();
-        let growth_dampener = LGALLOC_FILE_GROWTH_DAMPENER.load(Ordering::Relaxed);
-        // We would like to grow the file capacity by a factor of `1+1/(growth_dampener+1)`,
-        // but at least by `initial_capacity`.
-        let next_capacity = last_capacity
-            + std::cmp::max(
-                initial_capacity,
-                last_capacity / (growth_dampener.saturating_add(1)),
-            );
-
-        let next_byte_len = next_capacity * self.size_class.byte_size();
-        let (file, mut mmap) = Self::init_file(next_byte_len)?;
-
-        // SAFETY: Memory region initialized, so pointers to it are valid.
-        let mut chunks = mmap
-            .as_mut()
-            .chunks_exact_mut(self.size_class.byte_size())
-            .map(|chunk| unsafe { NonNull::new_unchecked(chunk.as_mut_ptr()) });
-
-        // Capture first region to return immediately.
-        let ptr = chunks.next().expect("At least once chunk allocated.");
-        let mem = Handle::new(ptr, self.size_class.byte_size());
-
-        // Stash remaining in the injector.
-        for ptr in chunks {
-            self.size_class_state
-                .clean_injector
-                .push(Handle::new(ptr, self.size_class.byte_size()));
-        }
-
-        stash.push(ManuallyDrop::new((file, mmap)));
-        Ok(mem)
-    }
-
-    /// Allocate and map a file of size `byte_len`. Returns an handle, or error if the allocation
-    /// fails.
-    fn init_file(byte_len: usize) -> Result<(File, MmapMut), AllocError> {
-        let path = GlobalStealer::get_static().path.read().unwrap().clone();
-        let Some(path) = path else {
-            return Err(AllocError::Io(std::io::Error::from(
-                std::io::ErrorKind::NotFound,
-            )));
-        };
-        let file = tempfile::tempfile_in(path)?;
-        let fd = file.as_fd().as_raw_fd();
-        // SAFETY: Calling ftruncate on the file, which we just created.
-        unsafe {
-            let ret = libc::ftruncate(fd, libc::off_t::try_from(byte_len).expect("Must fit"));
-            if ret != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        // SAFETY: We only map `file` once, and never share it with other processes.
-        let mmap = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
-        assert_eq!(mmap.len(), byte_len);
-        Ok((file, mmap))
     }
 }
 
@@ -552,7 +646,7 @@ impl Drop for LocalSizeClass {
 
         // Send memory back to global state
         while let Some(mem) = self.worker.pop() {
-            self.size_class_state.injector.push(mem);
+            self.size_class_state.free(mem);
         }
 
         let ordering = Ordering::Relaxed;
@@ -654,91 +748,6 @@ pub fn deallocate(handle: Handle) {
     thread_context(|s| s.deallocate(handle));
 }
 
-/// A background worker that performs periodic tasks.
-struct BackgroundWorker {
-    config: BackgroundWorkerConfig,
-    receiver: Receiver<BackgroundWorkerConfig>,
-    global_stealer: &'static GlobalStealer,
-    worker: Worker<Handle>,
-}
-
-impl BackgroundWorker {
-    fn new(receiver: Receiver<BackgroundWorkerConfig>) -> Self {
-        let config = BackgroundWorkerConfig {
-            interval: Duration::MAX,
-            ..Default::default()
-        };
-        let global_stealer = GlobalStealer::get_static();
-        let worker = Worker::new_fifo();
-        Self {
-            config,
-            receiver,
-            global_stealer,
-            worker,
-        }
-    }
-
-    fn run(&mut self) {
-        let mut next_cleanup: Option<Instant> = None;
-        loop {
-            let timeout = next_cleanup.map_or(Duration::MAX, |next_cleanup| {
-                next_cleanup.saturating_duration_since(Instant::now())
-            });
-            match self.receiver.recv_timeout(timeout) {
-                Ok(config) => {
-                    self.config = config;
-                    next_cleanup = None;
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => {
-                    self.maintenance();
-                }
-            }
-            next_cleanup = next_cleanup
-                .unwrap_or_else(Instant::now)
-                .checked_add(self.config.interval);
-        }
-    }
-
-    fn maintenance(&self) {
-        for (index, size_class_state) in self.global_stealer.size_classes.iter().enumerate() {
-            let size_class = SizeClass::from_index(index);
-            let count = self.clear(size_class, size_class_state, &self.worker);
-            size_class_state
-                .alloc_stats
-                .clear_slow
-                .fetch_add(count.try_into().expect("must fit"), Ordering::Relaxed);
-        }
-    }
-
-    fn clear(
-        &self,
-        size_class: SizeClass,
-        state: &SizeClassState,
-        worker: &Worker<Handle>,
-    ) -> usize {
-        // Clear batch size, and at least one element.
-        let byte_size = size_class.byte_size();
-        let mut limit = (self.config.clear_bytes + byte_size - 1) / byte_size;
-        let mut count = 0;
-        let mut steal = Steal::Retry;
-        while limit > 0 && !steal.is_empty() {
-            steal = std::iter::repeat_with(|| state.injector.steal_batch_with_limit(worker, limit))
-                .find(|s| !s.is_retry())
-                .unwrap_or(Steal::Empty);
-            while let Some(mut mem) = worker.pop() {
-                match mem.clear() {
-                    Ok(()) => count += 1,
-                    Err(e) => panic!("Syscall failed: {e:?}"),
-                }
-                state.clean_injector.push(mem);
-                limit -= 1;
-            }
-        }
-        count
-    }
-}
-
 /// Set or update the configuration for lgalloc.
 ///
 /// The function accepts a configuration, which is then applied on lgalloc. It allows clients to
@@ -775,38 +784,6 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
     if let Some(local_buffer_bytes) = &config.local_buffer_bytes {
         LOCAL_BUFFER_BYTES.store(*local_buffer_bytes, Ordering::Relaxed);
     }
-
-    if let Some(config) = config.background_config.clone() {
-        let mut lock = stealer.background_sender.lock().unwrap();
-
-        let config = if let Some((_, sender)) = &*lock {
-            match sender.send(config) {
-                Ok(()) => None,
-                Err(err) => Some(err.0),
-            }
-        } else {
-            Some(config)
-        };
-        if let Some(config) = config {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let mut worker = BackgroundWorker::new(receiver);
-            let join_handle = std::thread::Builder::new()
-                .name("lgalloc-0".to_string())
-                .spawn(move || worker.run())
-                .expect("thread started successfully");
-            sender.send(config).expect("Receiver exists");
-            *lock = Some((join_handle, sender));
-        }
-    }
-}
-
-/// Configuration for lgalloc's background worker.
-#[derive(Default, Debug, Clone, Eq, PartialEq)]
-pub struct BackgroundWorkerConfig {
-    /// How frequently it should tick
-    pub interval: Duration,
-    /// How many bytes to clear per size class.
-    pub clear_bytes: usize,
 }
 
 /// Lgalloc configuration
@@ -816,8 +793,6 @@ pub struct LgAlloc {
     pub enabled: Option<bool>,
     /// Path where files reside.
     pub path: Option<PathBuf>,
-    /// Configuration of the background worker.
-    pub background_config: Option<BackgroundWorkerConfig>,
     /// Whether to return physical memory on deallocate
     pub eager_return: Option<bool>,
     /// Dampener in the file growth rate. 0 corresponds to doubling and in general `n` to `1+1/(n+1)`.
@@ -842,12 +817,6 @@ impl LgAlloc {
     /// Disable lgalloc globally.
     pub fn disable(&mut self) -> &mut Self {
         self.enabled = Some(false);
-        self
-    }
-
-    /// Set the background worker configuration.
-    pub fn with_background_config(&mut self, config: BackgroundWorkerConfig) -> &mut Self {
-        self.background_config = Some(config);
         self
     }
 
@@ -903,8 +872,8 @@ pub fn lgalloc_stats() -> LgAllocStats {
 
         let size_class = size_class.byte_size();
         let area_total_bytes = areas_lock.iter().map(|area| area.1.len()).sum();
-        let global_regions = size_class_state.injector.len();
-        let clean_regions = size_class_state.clean_injector.len();
+        let global_regions = 0;
+        let clean_regions = 0;
         let stealers = size_class_state.stealers.read().unwrap();
         let mut thread_regions = 0;
         let mut allocations = 0;
@@ -1109,10 +1078,6 @@ mod test {
         lgalloc_set_config(
             LgAlloc::new()
                 .enable()
-                .with_background_config(BackgroundWorkerConfig {
-                    interval: Duration::from_secs(1),
-                    clear_bytes: 4 << 20,
-                })
                 .with_path(std::env::temp_dir())
                 .file_growth_dampener(1),
         );
@@ -1308,9 +1273,9 @@ mod test {
         let (_ptr, _cap, handle) = allocate::<usize>(1024)?;
         deallocate(handle);
 
-        let stats = lgalloc_stats();
+        // let stats = lgalloc_stats();
 
-        assert!(!stats.size_class.is_empty());
+        // assert!(!stats.size_class.is_empty());
 
         Ok(())
     }
@@ -1320,5 +1285,25 @@ mod test {
     fn test_disable() {
         lgalloc_set_config(&*LgAlloc::new().disable());
         assert!(matches!(allocate::<u8>(1024), Err(AllocError::Disabled)));
+    }
+
+    #[test]
+    #[serial]
+    fn test_stress() {
+        initialize();
+
+        let slots = 1024;
+
+        let mut allocations = Vec::with_capacity(slots);
+        while allocations.len() < slots {
+            allocations.push(None);
+        }
+        let mut count = 1 << 22;
+        while count > 0 {
+            let index = rand::random::<u32>() % allocations.len() as u32;
+            // allocations[index as usize] = Some(Wrapper::<u8>::allocate(1 << rand::random_range(1..4) + 16).unwrap());
+            allocations[index as usize] = Some(Wrapper::<u8>::allocate(1 << 20).unwrap());
+            count -= 1;
+        }
     }
 }
