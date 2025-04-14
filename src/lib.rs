@@ -300,7 +300,7 @@ impl GlobalBuddyAllocator {
             assert_eq!(cap, size_class.byte_size());
             self.check();
             return Ok(Handle::new(
-                unsafe { NonNull::new_unchecked(ptr as *mut u8) },
+                unsafe { NonNull::new_unchecked(ptr) },
                 size_class.byte_size(),
             ));
         }
@@ -315,7 +315,7 @@ impl GlobalBuddyAllocator {
         }
         // Check if we did not find a free block
         if probe_size_class == MAX_LOG_SIZE {
-            let (file, mut mmap) = self.new_memory(size_class.byte_size())?;
+            let (file, mut mmap) = self.new_memory(size_class.byte_size() * 2)?;
             let capacity = mmap.len();
             assert_eq!(
                 capacity.trailing_zeros(),
@@ -327,7 +327,7 @@ impl GlobalBuddyAllocator {
             while cap > 0 {
                 let max_lg_size = ptr.addr().trailing_zeros();
                 let this_size: usize = 1 << std::cmp::min(cap.ilog2(), max_lg_size);
-                if this_size > size_class.byte_size() {
+                if this_size >= size_class.byte_size() {
                     probe_size_class =
                         std::cmp::min(probe_size_class, this_size.trailing_zeros() as usize);
                 }
@@ -377,25 +377,26 @@ impl GlobalBuddyAllocator {
     fn merge(&mut self, ptr: *mut u8, len: usize) -> Option<*mut u8> {
         // 0b10|00 and 0b11|00 are buddies
         let merged = ptr.map_addr(|this| this & !len);
-        let buddy = ptr.map_addr(|this| this ^ len);
+        let buddy = unsafe { merged.add(len) };
 
-        let this_len = self.memory.get(&ptr).copied().unwrap();
+        debug_assert!(merged == ptr || buddy == ptr);
+
+        let this_len = self.memory.get(&merged).copied();
         let buddy_len = self.memory.get(&buddy).copied();
 
-        if Some(this_len) == buddy_len {
-            println!("Merging {ptr:?} {buddy:?} {this_len:x}");
-            let _ = self.memory.remove(&buddy).unwrap();
-            let _ = self.memory.remove(&ptr).unwrap();
-            // Buddy is free, merge
-            let new_size_class = this_len.trailing_zeros() as usize;
-            assert!(self.free[new_size_class].remove(&buddy));
-            assert!(self.free[new_size_class].remove(&ptr));
-            self.insert(merged, this_len * 2);
-            // self.memory.insert(this, cap + len);
-            // self.free[new_size_class + 1].insert(this);
-            Some(merged)
-        } else {
-            None
+        match (this_len, buddy_len) {
+            // Buddy is free and has same length, merge
+            (Some(this_len), Some(buddy_len)) if this_len == buddy_len => {
+                // println!("Merging {ptr:?} {buddy:?} {this_len:x}");
+                let _ = self.memory.remove(&buddy).unwrap();
+                let _ = self.memory.remove(&merged).unwrap();
+                let new_size_class = this_len.trailing_zeros() as usize;
+                assert!(self.free[new_size_class].remove(&buddy));
+                assert!(self.free[new_size_class].remove(&merged));
+                self.insert(merged, this_len * 2);
+                Some(merged)
+            }
+            _ => None,
         }
     }
 
