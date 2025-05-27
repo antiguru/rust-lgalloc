@@ -974,7 +974,7 @@ impl LgAllocStats {
         Self {
             size_class: size_class_stats,
             file: file_stats,
-            map: numa_map.is_some().then_some(map_stats),
+            map: numa_map.map(|_| map_stats),
         }
     }
 }
