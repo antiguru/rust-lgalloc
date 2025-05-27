@@ -45,13 +45,13 @@ fn main() {
 fn print_stats() {
     let stats = lgalloc::lgalloc_stats_with_mapping().unwrap();
 
-    for (size_class, file_stats) in &stats.file_stats {
+    for (size_class, file_stats) in &stats.file {
         match file_stats {
             Ok(file_stats) => println!("file_stats {size_class} {file_stats:?}"),
             Err(e) => eprintln!("Failed to read file stats for size class {size_class}: {e}"),
         }
     }
-    for (size_class, map_stats) in stats.map_stats.iter().flatten() {
+    for (size_class, map_stats) in stats.map.iter().flatten() {
         println!("map_stats {size_class} {map_stats:?}");
     }
 }

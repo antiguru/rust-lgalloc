@@ -6,7 +6,7 @@ We spell it `lgalloc` and pronounce it el-gee-alloc.
 
 ```toml
 [dependencies]
-lgalloc = "0.2"
+lgalloc = "0.6"
 ```
 
 ## Example
@@ -39,6 +39,36 @@ fn main() -> Result<(), lgalloc::AllocError> {
 ```
 
 ## Details
+
+Lgalloc is a memory allocator that backs allocations with memory-mapped sparse files.
+It is size-classed, meaning that it can only allocate memory in power-of-two sized regions, and each region
+is independent of the others. Each region is backed by files of increasing size.
+
+Memory mapped files allow the operating system to evict pages from the page cache under memory pressure,
+thus enabling some form of paging without using swap space. This is useful in environments where
+swapping is not available (e.g, Kubernetes), or where the application wants to retain control over
+which pages can be evicted.
+
+Lgalloc provides a low-level API, but does not expose a high-level interface. Clients are advised to
+implement their own high-level abstractions, such as vectors or other data structures, on top of
+lgalloc.
+
+Memory mapped files have some properties that are not immediately obvious, and sometimes depend on the
+particular configuration of the operating system. The most important ones are:
+- Allocations do not use physical memory until they are touched. Once touched, they use physical memory
+  and equivalent space on disk. Linux allocates space on disk eagerly, but other operating systems
+  might not. This means that touching memory can cause I/O operations, which can be slow.
+- Returning memory is a two-step process. After deallocation, lgalloc tries to free the physical memory
+  by calling `MADV_DONTNEED`. It's not entirely clear what Linux does with this, but it seems to
+  remove the pages from the page cache, while leaving the disk allocation intact. Lgalloc offers an
+  optional background worker that periodically calls `MADV_FREE` on unused memory regions. This
+  punches holes into the underlying file, which allows the OS to reclaim disk space. Note that this
+  causes I/O operations, which can be slow.
+- Interacting with the memory subsystem can cause contention, especially when multiple threads
+  try to interact with the virtual address space at the same time. For example, reading the
+  `/proc/self/numa_maps` file can cause contention, as can the `mmap` and `madvise` system calls.
+  Other parts of the program, for example the allocator, might use syscalls that can contend with
+  lgalloc.
 
 - Lgalloc provides an allocator for power-of-two sized memory regions, with an optional dampener.
 - The requested capacity can be rounded up to a larger capacity.
