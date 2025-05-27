@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/antiguru/rust-lgalloc/compare/v0.5.0...v0.6.0) - 2025-05-27
+
+### Other
+
+- Split fast and slow stats ([#62](https://github.com/antiguru/rust-lgalloc/pull/62))
+
 ## [0.5.0](https://github.com/antiguru/rust-lgalloc/compare/v0.4.0...v0.5.0) - 2025-02-27
 
 ### Other
