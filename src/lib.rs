@@ -110,7 +110,6 @@ impl Handle {
         let ret = unsafe { libc::madvise(ptr, self.len, advice) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            eprintln!("madvise failed: {ret} {err:?}",);
             return Err(err);
         }
         Ok(())
@@ -264,6 +263,10 @@ struct SizeClassState {
     stealers: RwLock<HashMap<ThreadId, PerThreadState<Handle>>>,
     /// Summed stats for terminated threads.
     alloc_stats: AllocStats,
+    /// Total virtual size of all mappings in this size class in bytes.
+    total_bytes: AtomicUsize,
+    /// Count of areas backing this size class.
+    area_count: AtomicUsize,
 }
 
 impl GlobalStealer {
@@ -375,7 +378,7 @@ impl LocalSizeClass {
 
         let stats = Arc::new(AllocStats::default());
 
-        let mut lock = size_class_state.stealers.write().unwrap();
+        let mut lock = size_class_state.stealers.write().expect("lock poisoned");
         lock.insert(
             thread_id,
             PerThreadState {
@@ -426,7 +429,7 @@ impl LocalSizeClass {
                             self.size_class_state
                                 .stealers
                                 .read()
-                                .unwrap()
+                                .expect("lock poisoned")
                                 .values()
                                 .map(|state| state.stealer.steal())
                                 .collect()
@@ -446,7 +449,7 @@ impl LocalSizeClass {
             Err(AllocError::OutOfMemory) => {
                 self.stats.slow_path.fetch_add(1, Ordering::Relaxed);
                 // Get a slow-path lock
-                let _lock = self.size_class_state.lock.lock().unwrap();
+                let _lock = self.size_class_state.lock.lock().expect("lock poisoned");
                 // Try again because another thread might have refilled already
                 if let Ok(mem) = self.get() {
                     return Ok(mem);
@@ -479,7 +482,7 @@ impl LocalSizeClass {
     /// Returns an error if the memory pool cannot be refilled.
     fn try_refill_and_get(&self) -> Result<Handle, AllocError> {
         self.stats.refill.fetch_add(1, Ordering::Relaxed);
-        let mut stash = self.size_class_state.areas.write().unwrap();
+        let mut stash = self.size_class_state.areas.write().expect("lock poisoned");
 
         let initial_capacity = std::cmp::max(1, INITIAL_SIZE / self.size_class.byte_size());
 
@@ -497,11 +500,18 @@ impl LocalSizeClass {
         let next_byte_len = next_capacity * self.size_class.byte_size();
         let (file, mut mmap) = Self::init_file(next_byte_len)?;
 
+        self.size_class_state
+            .total_bytes
+            .fetch_add(next_byte_len, Ordering::Relaxed);
+        self.size_class_state
+            .area_count
+            .fetch_add(1, Ordering::Relaxed);
+
         // SAFETY: Memory region initialized, so pointers to it are valid.
         let mut chunks = mmap
             .as_mut()
             .chunks_exact_mut(self.size_class.byte_size())
-            .map(|chunk| unsafe { NonNull::new_unchecked(chunk.as_mut_ptr()) });
+            .map(|chunk| NonNull::new(chunk.as_mut_ptr()).expect("non-null"));
 
         // Capture first region to return immediately.
         let ptr = chunks.next().expect("At least once chunk allocated.");
@@ -521,20 +531,25 @@ impl LocalSizeClass {
     /// Allocate and map a file of size `byte_len`. Returns an handle, or error if the allocation
     /// fails.
     fn init_file(byte_len: usize) -> Result<(File, MmapMut), AllocError> {
-        let path = GlobalStealer::get_static().path.read().unwrap().clone();
-        let Some(path) = path else {
-            return Err(AllocError::Io(std::io::Error::from(
-                std::io::ErrorKind::NotFound,
-            )));
+        let file = {
+            let path = GlobalStealer::get_static()
+                .path
+                .read()
+                .expect("lock poisoned");
+            let Some(path) = &*path else {
+                return Err(AllocError::Io(std::io::Error::from(
+                    std::io::ErrorKind::NotFound,
+                )));
+            };
+            tempfile::tempfile_in(path)?
         };
-        let file = tempfile::tempfile_in(path)?;
         let fd = file.as_fd().as_raw_fd();
+        let length = libc::off_t::try_from(byte_len).expect("Must fit");
         // SAFETY: Calling ftruncate on the file, which we just created.
-        unsafe {
-            let ret = libc::ftruncate(fd, libc::off_t::try_from(byte_len).expect("Must fit"));
-            if ret != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
+        let ret = unsafe { libc::ftruncate(fd, length) };
+        if ret != 0 {
+            // file goes out of scope here, so no need for further cleanup.
+            return Err(std::io::Error::last_os_error().into());
         }
         // SAFETY: We only map `file` once, and never share it with other processes.
         let mmap = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
@@ -765,7 +780,7 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
     }
 
     if let Some(path) = &config.path {
-        *stealer.path.write().unwrap() = Some(path.clone());
+        *stealer.path.write().expect("lock poisoned") = Some(path.clone());
     }
 
     if let Some(file_growth_dampener) = &config.file_growth_dampener {
@@ -777,7 +792,7 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
     }
 
     if let Some(config) = config.background_config.clone() {
-        let mut lock = stealer.background_sender.lock().unwrap();
+        let mut lock = stealer.background_sender.lock().expect("lock poisoned");
 
         let config = if let Some((_, sender)) = &*lock {
             match sender.send(config) {
@@ -876,36 +891,130 @@ impl LgAlloc {
     }
 }
 
-/// Determine global statistics per size class
+/// Determine global statistics per size class.
 ///
-/// Note that this function take a read lock on various structures.
+/// This function is supposed to be relatively fast. It causes some syscalls, but they
+/// should be cheap (stat on a file descriptor).
+///
+/// Note that this function take a read lock on various structures. It calls `fstat` while
+/// holding a read lock on portions of the global state, which can block refills until the
+/// function returns.
 ///
 /// # Panics
 ///
 /// Panics if the internal state of lgalloc is corrupted.
 pub fn lgalloc_stats() -> LgAllocStats {
-    let mut numa_map = NumaMap::from_file("/proc/self/numa_maps");
+    LgAllocStats::read(None)
+}
 
-    let global = GlobalStealer::get_static();
+/// Determine global statistics per size class, and include mapping information.
+///
+/// This function can be very slow as it needs to read the `numa_maps` file. Depending
+/// on the heap size of the program, this can take seconds to minutes, so call this
+/// function with care.
+///
+/// Note that this function take a read lock on various structures. In addition to the locks
+/// described on [`lgalloc_stats`], this function reads the `/proc/self/numa_maps` file without
+/// holding any locks, but the kernel might block other memory operations while reading this file.
+///
+/// # Panics
+///
+/// Panics if the internal state of lgalloc is corrupted.
+pub fn lgalloc_stats_with_mapping() -> std::io::Result<LgAllocStats> {
+    let mut numa_map = NumaMap::from_file("/proc/self/numa_maps")?;
+    Ok(LgAllocStats::read(Some(&mut numa_map)))
+}
 
-    let mut size_classes = Vec::with_capacity(global.size_classes.len());
-    let mut file_stats = Vec::new();
+/// Statistics about lgalloc's internal behavior.
+#[derive(Debug)]
+pub struct LgAllocStats {
+    /// Per size-class statistics.
+    pub size_class: Vec<(usize, SizeClassStats)>,
+    /// Per size-class and backing file statistics. Each entry identifies the
+    /// size class it describes, and there can be multiple entries for each size class.
+    pub file: Vec<(usize, std::io::Result<FileStats>)>,
+    /// Per size-class and map statistics. Each entry identifies the
+    /// size class it describes, and there can be multiple entries for each size class.
+    pub map: Option<Vec<(usize, MapStats)>>,
+}
 
-    for (index, size_class_state) in global.size_classes.iter().enumerate() {
-        let size_class = SizeClass::from_index(index);
+impl LgAllocStats {
+    /// Read lgalloc statistics.
+    ///
+    /// Supply a `numa_map` to obtain mapping stats.
+    fn read(mut numa_map: Option<&mut NumaMap>) -> Self {
+        let global = GlobalStealer::get_static();
 
-        let areas_lock = size_class_state.areas.read().unwrap();
-
-        let areas = areas_lock.len();
-        if areas == 0 {
-            continue;
+        if let Some(numa_map) = numa_map.as_mut() {
+            // Normalize numa_maps, and sort by address.
+            for entry in &mut numa_map.ranges {
+                entry.normalize();
+            }
+            numa_map.ranges.sort();
         }
 
-        let size_class = size_class.byte_size();
-        let area_total_bytes = areas_lock.iter().map(|area| area.1.len()).sum();
+        let mut size_class_stats = Vec::with_capacity(VALID_SIZE_CLASS.len());
+        let mut file_stats = Vec::default();
+        let mut map_stats = Vec::default();
+        for (index, state) in global.size_classes.iter().enumerate() {
+            let size_class = SizeClass::from_index(index);
+            let size_class_bytes = size_class.byte_size();
+
+            size_class_stats.push((size_class_bytes, SizeClassStats::from(state)));
+
+            let areas = state.areas.read().expect("lock poisoned");
+            for (file, mmap) in areas.iter().map(Deref::deref) {
+                file_stats.push((size_class_bytes, FileStats::extract_from(file)));
+                if let Some(numa_map) = numa_map.as_deref() {
+                    map_stats.push((size_class_bytes, MapStats::extract_from(mmap, numa_map)));
+                }
+            }
+        }
+
+        Self {
+            size_class: size_class_stats,
+            file: file_stats,
+            map: numa_map.map(|_| map_stats),
+        }
+    }
+}
+
+/// Statistics per size class.
+#[derive(Debug)]
+pub struct SizeClassStats {
+    /// Number of areas backing a size class.
+    pub areas: usize,
+    /// Total number of bytes summed across all areas.
+    pub area_total_bytes: usize,
+    /// Free regions
+    pub free_regions: usize,
+    /// Clean free regions in the global allocator
+    pub clean_regions: usize,
+    /// Regions in the global allocator
+    pub global_regions: usize,
+    /// Regions retained in thread-local allocators
+    pub thread_regions: usize,
+    /// Total allocations
+    pub allocations: u64,
+    /// Total slow-path allocations (globally out of memory)
+    pub slow_path: u64,
+    /// Total refills
+    pub refill: u64,
+    /// Total deallocations
+    pub deallocations: u64,
+    /// Total times memory has been returned to the OS (eager reclamation) in regions.
+    pub clear_eager_total: u64,
+    /// Total times memory has been returned to the OS (slow reclamation) in regions.
+    pub clear_slow_total: u64,
+}
+
+impl From<&SizeClassState> for SizeClassStats {
+    fn from(size_class_state: &SizeClassState) -> Self {
+        let areas = size_class_state.area_count.load(Ordering::Relaxed);
+        let area_total_bytes = size_class_state.total_bytes.load(Ordering::Relaxed);
         let global_regions = size_class_state.injector.len();
         let clean_regions = size_class_state.clean_injector.len();
-        let stealers = size_class_state.stealers.read().unwrap();
+        let stealers = size_class_state.stealers.read().expect("lock poisoned");
         let mut thread_regions = 0;
         let mut allocations = 0;
         let mut deallocations = 0;
@@ -933,9 +1042,7 @@ pub fn lgalloc_stats() -> LgAllocStats {
         slow_path += global_stats.slow_path.load(Ordering::Relaxed);
         clear_eager_total += global_stats.clear_eager.load(Ordering::Relaxed);
         clear_slow_total += global_stats.clear_slow.load(Ordering::Relaxed);
-
-        size_classes.push(SizeClassStats {
-            size_class,
+        Self {
             areas,
             area_total_bytes,
             free_regions,
@@ -948,149 +1055,88 @@ pub fn lgalloc_stats() -> LgAllocStats {
             slow_path,
             clear_eager_total,
             clear_slow_total,
-        });
-
-        if let Ok(numa_map) = numa_map.as_mut() {
-            let areas = &areas_lock[..];
-            file_stats.extend(extract_file_stats(
-                size_class,
-                numa_map,
-                areas.iter().map(Deref::deref),
-            ));
         }
     }
-
-    LgAllocStats {
-        file_stats: match numa_map {
-            Ok(_) => Ok(file_stats),
-            Err(err) => Err(err),
-        },
-        size_class: size_classes,
-    }
-}
-
-/// Extract for a size class area stats.
-fn extract_file_stats<'a>(
-    size_class: usize,
-    numa_map: &'a mut NumaMap,
-    areas: impl IntoIterator<Item = &'a (File, MmapMut)> + 'a,
-) -> impl Iterator<Item = FileStats> + 'a {
-    // Normalize numa_maps, and sort by address.
-    for entry in &mut numa_map.ranges {
-        entry.normalize();
-    }
-    numa_map.ranges.sort();
-
-    areas.into_iter().map(move |(file, mmap)| {
-        let (mapped, active, dirty) = {
-            let base = mmap.as_ptr().cast::<()>() as usize;
-            let range = match numa_map
-                .ranges
-                .binary_search_by(|range| range.address.cmp(&base))
-            {
-                Ok(pos) => Some(&numa_map.ranges[pos]),
-                // `numa_maps` only updates periodically, so we might be missing some
-                // expected ranges.
-                Err(_pos) => None,
-            };
-
-            let mut mapped = 0;
-            let mut active = 0;
-            let mut dirty = 0;
-            for property in range.iter().flat_map(|e| e.properties.iter()) {
-                match property {
-                    numa_maps::Property::Dirty(d) => dirty = *d,
-                    numa_maps::Property::Mapped(m) => mapped = *m,
-                    numa_maps::Property::Active(a) => active = *a,
-                    _ => {}
-                }
-            }
-            (mapped, active, dirty)
-        };
-
-        let mut stat: MaybeUninit<libc::stat> = MaybeUninit::uninit();
-        // SAFETY: File descriptor valid, stat object valid.
-        let ret = unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) };
-        let stat = if ret == -1 {
-            None
-        } else {
-            // SAFETY: `stat` is initialized in the fstat non-error case.
-            Some(unsafe { stat.assume_init_ref() })
-        };
-
-        let (blocks, file_size) = stat.map_or((0, 0), |stat| {
-            (
-                stat.st_blocks.try_into().unwrap_or(0),
-                stat.st_size.try_into().unwrap_or(0),
-            )
-        });
-        FileStats {
-            size_class,
-            file_size,
-            // Documented as multiples of 512
-            allocated_size: blocks * 512,
-            mapped,
-            active,
-            dirty,
-        }
-    })
-}
-
-/// Statistics about lgalloc's internal behavior.
-#[derive(Debug)]
-pub struct LgAllocStats {
-    /// Per size-class statistics.
-    pub size_class: Vec<SizeClassStats>,
-    /// Per size-class and backing file statistics.
-    pub file_stats: Result<Vec<FileStats>, std::io::Error>,
-}
-
-/// Statistics per size class.
-#[derive(Debug)]
-pub struct SizeClassStats {
-    /// Size class in bytes
-    pub size_class: usize,
-    /// Number of areas backing a size class.
-    pub areas: usize,
-    /// Total number of bytes summed across all areas.
-    pub area_total_bytes: usize,
-    /// Free regions
-    pub free_regions: usize,
-    /// Clean free regions in the global allocator
-    pub clean_regions: usize,
-    /// Regions in the global allocator
-    pub global_regions: usize,
-    /// Regions retained in thread-local allocators
-    pub thread_regions: usize,
-    /// Total allocations
-    pub allocations: u64,
-    /// Total slow-path allocations (globally out of memory)
-    pub slow_path: u64,
-    /// Total refills
-    pub refill: u64,
-    /// Total deallocations
-    pub deallocations: u64,
-    /// Total times memory has been returned to the OS (eager reclamation) in regions.
-    pub clear_eager_total: u64,
-    /// Total times memory has been returned to the OS (slow reclamation) in regions.
-    pub clear_slow_total: u64,
 }
 
 /// Statistics per size class and backing file.
 #[derive(Debug)]
 pub struct FileStats {
-    /// The size class in bytes.
-    pub size_class: usize,
     /// The size of the file in bytes.
     pub file_size: usize,
     /// Size of the file on disk in bytes.
     pub allocated_size: usize,
+}
+
+impl FileStats {
+    /// Extract file statistics from a file descriptor. Calls `fstat` on the file to obtain
+    /// the size and allocated size.
+    fn extract_from(file: &File) -> std::io::Result<Self> {
+        let mut stat: MaybeUninit<libc::stat> = MaybeUninit::uninit();
+        // SAFETY: File descriptor valid, stat object valid.
+        let ret = unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) };
+        if ret == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: `stat` is initialized in the fstat non-error case.
+            let stat = unsafe { stat.assume_init_ref() };
+            let blocks = stat.st_blocks.try_into().unwrap_or(0);
+            let file_size = stat.st_size.try_into().unwrap_or(0);
+            Ok(FileStats {
+                file_size,
+                // Documented as multiples of 512
+                allocated_size: blocks * 512,
+            })
+        }
+    }
+}
+
+/// Statistics per size class and mapping.
+#[derive(Debug)]
+pub struct MapStats {
     /// Number of mapped bytes, if different from `dirty`. Consult `man 7 numa` for details.
     pub mapped: usize,
     /// Number of active bytes. Consult `man 7 numa` for details.
     pub active: usize,
     /// Number of dirty bytes. Consult `man 7 numa` for details.
     pub dirty: usize,
+}
+
+impl MapStats {
+    /// Extract memory map stats for `mmap` based on `numa_map`.
+    ///
+    /// The ranges of in the numa map file must be sorted by address and normalized.
+    fn extract_from(mmap: &MmapMut, numa_map: &NumaMap) -> Self {
+        // TODO: Use `addr` once our MSRV is 1.84.
+        let base = mmap.as_ptr().cast::<()>() as usize;
+        let range = match numa_map
+            .ranges
+            .binary_search_by(|range| range.address.cmp(&base))
+        {
+            Ok(pos) => Some(&numa_map.ranges[pos]),
+            // `numa_maps` only updates periodically, so we might be missing some
+            // expected ranges.
+            Err(_pos) => None,
+        };
+
+        let mut mapped = 0;
+        let mut active = 0;
+        let mut dirty = 0;
+        for property in range.iter().flat_map(|e| e.properties.iter()) {
+            match property {
+                numa_maps::Property::Dirty(d) => dirty = *d,
+                numa_maps::Property::Mapped(m) => mapped = *m,
+                numa_maps::Property::Active(a) => active = *a,
+                _ => {}
+            }
+        }
+
+        Self {
+            mapped,
+            active,
+            dirty,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1250,13 +1296,11 @@ mod test {
         for size_class in &stats.size_class {
             println!("size_class {:?}", size_class);
         }
-        match stats.file_stats {
-            Ok(file_stats) => {
-                for file_stats in file_stats {
-                    println!("file_stats {:?}", file_stats);
-                }
+        for (size_class, file_stats) in &stats.file {
+            match file_stats {
+                Ok(file_stats) => println!("file_stats {size_class} {file_stats:?}"),
+                Err(e) => eprintln!("error: {e}"),
             }
-            Err(e) => eprintln!("error: {e}"),
         }
         Ok(())
     }
