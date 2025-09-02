@@ -120,7 +120,7 @@ impl Handle {
 const INITIAL_SIZE: usize = 32 << 20;
 
 /// Range of valid size classes.
-pub const VALID_SIZE_CLASS: Range<usize> = 10..37;
+pub const VALID_SIZE_CLASS: Range<usize> = 20..37;
 
 /// Strategy to indicate that the OS can reclaim pages
 // TODO: On Linux, we want to use MADV_REMOVE, but that's only supported
@@ -252,7 +252,7 @@ struct SizeClassState {
     /// Handle to memory-mapped regions.
     ///
     /// We must never dereference the memory-mapped regions stored here.
-    areas: RwLock<Vec<ManuallyDrop<(File, MmapMut)>>>,
+    areas: RwLock<Vec<ManuallyDrop<(usize, usize)>>>,
     /// Injector to distribute memory globally.
     injector: Injector<Handle>,
     /// Injector to distribute memory globally, freed memory.
@@ -487,7 +487,7 @@ impl LocalSizeClass {
         let initial_capacity = std::cmp::max(1, INITIAL_SIZE / self.size_class.byte_size());
 
         let last_capacity =
-            stash.iter().last().map_or(0, |mmap| mmap.1.len()) / self.size_class.byte_size();
+            stash.iter().last().map_or(0, |mmap| mmap.1) / self.size_class.byte_size();
         let growth_dampener = LGALLOC_FILE_GROWTH_DAMPENER.load(Ordering::Relaxed);
         // We would like to grow the file capacity by a factor of `1+1/(growth_dampener+1)`,
         // but at least by `initial_capacity`.
@@ -498,7 +498,21 @@ impl LocalSizeClass {
             );
 
         let next_byte_len = next_capacity * self.size_class.byte_size();
-        let (file, mut mmap) = Self::init_file(next_byte_len)?;
+        // let (file, mut mmap) = Self::init_file(next_byte_len)?;
+
+        let mmap = unsafe {
+            libc::mmap(std::ptr::null_mut(), next_byte_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+                0,
+                0)
+        };
+        if mmap == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let slice = unsafe {
+            std::slice::from_raw_parts_mut(mmap.cast::<u8>(), next_byte_len)
+        };
 
         self.size_class_state
             .total_bytes
@@ -508,8 +522,7 @@ impl LocalSizeClass {
             .fetch_add(1, Ordering::Relaxed);
 
         // SAFETY: Memory region initialized, so pointers to it are valid.
-        let mut chunks = mmap
-            .as_mut()
+        let mut chunks = slice
             .chunks_exact_mut(self.size_class.byte_size())
             .map(|chunk| NonNull::new(chunk.as_mut_ptr()).expect("non-null"));
 
@@ -524,7 +537,7 @@ impl LocalSizeClass {
                 .push(Handle::new(ptr, self.size_class.byte_size()));
         }
 
-        stash.push(ManuallyDrop::new((file, mmap)));
+        stash.push(ManuallyDrop::new((mmap.addr(), next_byte_len)));
         Ok(mem)
     }
 
