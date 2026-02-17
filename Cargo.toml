@@ -9,16 +9,14 @@ repository = "https://github.com/antiguru/rust-lgalloc"
 rust-version = "1.72"
 
 [dependencies]
-crossbeam-deque = "0.8.3"
+crossbeam-deque = "0.8.5"
 libc = "0.2"
-memmap2 = "0.5"
 numa_maps = "0.1"
 page_size = "0.6.0"
-tempfile = "3"
-thiserror = "1.0"
+thiserror = "2.0"
 
 [dev-dependencies]
-serial_test = "2.0"
+serial_test = "3.2"
 
 [profile.release]
 debug = 2

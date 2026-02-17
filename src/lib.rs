@@ -21,11 +21,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::File;
 use std::marker::PhantomData;
-use std::mem::{take, ManuallyDrop, MaybeUninit};
-use std::ops::{Deref, Range};
-use std::os::fd::{AsFd, AsRawFd};
+use std::mem::{take, ManuallyDrop};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -35,7 +33,6 @@ use std::thread::{JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
-use memmap2::MmapMut;
 use numa_maps::NumaMap;
 use thiserror::Error;
 
@@ -503,12 +500,20 @@ impl LocalSizeClass {
         let mmap = unsafe {
             libc::mmap(std::ptr::null_mut(), next_byte_len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
-                0,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
                 0)
         };
         if mmap == libc::MAP_FAILED {
+            println!("mmap failed, length {next_byte_len}");
+            println!("mmap failed: {}", std::io::Error::last_os_error());
             return Err(std::io::Error::last_os_error().into());
+        }
+        unsafe {
+            let ret = libc::madvise(mmap, next_byte_len, libc::MADV_HUGEPAGE);
+            if ret == -1 {
+                return Err(std::io::Error::last_os_error().into());
+            }
         }
         let slice = unsafe {
             std::slice::from_raw_parts_mut(mmap.cast::<u8>(), next_byte_len)
@@ -539,35 +544,6 @@ impl LocalSizeClass {
 
         stash.push(ManuallyDrop::new((mmap.addr(), next_byte_len)));
         Ok(mem)
-    }
-
-    /// Allocate and map a file of size `byte_len`. Returns an handle, or error if the allocation
-    /// fails.
-    fn init_file(byte_len: usize) -> Result<(File, MmapMut), AllocError> {
-        let file = {
-            let path = GlobalStealer::get_static()
-                .path
-                .read()
-                .expect("lock poisoned");
-            let Some(path) = &*path else {
-                return Err(AllocError::Io(std::io::Error::from(
-                    std::io::ErrorKind::NotFound,
-                )));
-            };
-            tempfile::tempfile_in(path)?
-        };
-        let fd = file.as_fd().as_raw_fd();
-        let length = libc::off_t::try_from(byte_len).expect("Must fit");
-        // SAFETY: Calling ftruncate on the file, which we just created.
-        let ret = unsafe { libc::ftruncate(fd, length) };
-        if ret != 0 {
-            // file goes out of scope here, so no need for further cleanup.
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: We only map `file` once, and never share it with other processes.
-        let mmap = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
-        assert_eq!(mmap.len(), byte_len);
-        Ok((file, mmap))
     }
 }
 
@@ -943,9 +919,6 @@ pub fn lgalloc_stats_with_mapping() -> std::io::Result<LgAllocStats> {
 pub struct LgAllocStats {
     /// Per size-class statistics.
     pub size_class: Vec<(usize, SizeClassStats)>,
-    /// Per size-class and backing file statistics. Each entry identifies the
-    /// size class it describes, and there can be multiple entries for each size class.
-    pub file: Vec<(usize, std::io::Result<FileStats>)>,
     /// Per size-class and map statistics. Each entry identifies the
     /// size class it describes, and there can be multiple entries for each size class.
     pub map: Option<Vec<(usize, MapStats)>>,
@@ -967,26 +940,16 @@ impl LgAllocStats {
         }
 
         let mut size_class_stats = Vec::with_capacity(VALID_SIZE_CLASS.len());
-        let mut file_stats = Vec::default();
-        let mut map_stats = Vec::default();
+        let map_stats = Vec::default();
         for (index, state) in global.size_classes.iter().enumerate() {
             let size_class = SizeClass::from_index(index);
             let size_class_bytes = size_class.byte_size();
 
             size_class_stats.push((size_class_bytes, SizeClassStats::from(state)));
-
-            let areas = state.areas.read().expect("lock poisoned");
-            for (file, mmap) in areas.iter().map(Deref::deref) {
-                file_stats.push((size_class_bytes, FileStats::extract_from(file)));
-                if let Some(numa_map) = numa_map.as_deref() {
-                    map_stats.push((size_class_bytes, MapStats::extract_from(mmap, numa_map)));
-                }
-            }
         }
 
         Self {
             size_class: size_class_stats,
-            file: file_stats,
             map: numa_map.map(|_| map_stats),
         }
     }
@@ -1072,38 +1035,6 @@ impl From<&SizeClassState> for SizeClassStats {
     }
 }
 
-/// Statistics per size class and backing file.
-#[derive(Debug)]
-pub struct FileStats {
-    /// The size of the file in bytes.
-    pub file_size: usize,
-    /// Size of the file on disk in bytes.
-    pub allocated_size: usize,
-}
-
-impl FileStats {
-    /// Extract file statistics from a file descriptor. Calls `fstat` on the file to obtain
-    /// the size and allocated size.
-    fn extract_from(file: &File) -> std::io::Result<Self> {
-        let mut stat: MaybeUninit<libc::stat> = MaybeUninit::uninit();
-        // SAFETY: File descriptor valid, stat object valid.
-        let ret = unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) };
-        if ret == -1 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            // SAFETY: `stat` is initialized in the fstat non-error case.
-            let stat = unsafe { stat.assume_init_ref() };
-            let blocks = stat.st_blocks.try_into().unwrap_or(0);
-            let file_size = stat.st_size.try_into().unwrap_or(0);
-            Ok(FileStats {
-                file_size,
-                // Documented as multiples of 512
-                allocated_size: blocks * 512,
-            })
-        }
-    }
-}
-
 /// Statistics per size class and mapping.
 #[derive(Debug)]
 pub struct MapStats {
@@ -1113,43 +1044,6 @@ pub struct MapStats {
     pub active: usize,
     /// Number of dirty bytes. Consult `man 7 numa` for details.
     pub dirty: usize,
-}
-
-impl MapStats {
-    /// Extract memory map stats for `mmap` based on `numa_map`.
-    ///
-    /// The ranges of in the numa map file must be sorted by address and normalized.
-    fn extract_from(mmap: &MmapMut, numa_map: &NumaMap) -> Self {
-        // TODO: Use `addr` once our MSRV is 1.84.
-        let base = mmap.as_ptr().cast::<()>() as usize;
-        let range = match numa_map
-            .ranges
-            .binary_search_by(|range| range.address.cmp(&base))
-        {
-            Ok(pos) => Some(&numa_map.ranges[pos]),
-            // `numa_maps` only updates periodically, so we might be missing some
-            // expected ranges.
-            Err(_pos) => None,
-        };
-
-        let mut mapped = 0;
-        let mut active = 0;
-        let mut dirty = 0;
-        for property in range.iter().flat_map(|e| e.properties.iter()) {
-            match property {
-                numa_maps::Property::Dirty(d) => dirty = *d,
-                numa_maps::Property::Mapped(m) => mapped = *m,
-                numa_maps::Property::Active(a) => active = *a,
-                _ => {}
-            }
-        }
-
-        Self {
-            mapped,
-            active,
-            dirty,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1309,12 +1203,6 @@ mod test {
         for size_class in &stats.size_class {
             println!("size_class {:?}", size_class);
         }
-        for (size_class, file_stats) in &stats.file {
-            match file_stats {
-                Ok(file_stats) => println!("file_stats {size_class} {file_stats:?}"),
-                Err(e) => eprintln!("error: {e}"),
-            }
-        }
         Ok(())
     }
 
@@ -1326,7 +1214,7 @@ mod test {
             path: Some(std::env::temp_dir()),
             ..Default::default()
         });
-        let r = <Wrapper<u8>>::allocate(1000)?;
+        let r = <Wrapper<u8>>::allocate(1 << 20)?;
 
         let thread = std::thread::spawn(move || drop(r));
 
