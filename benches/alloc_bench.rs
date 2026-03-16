@@ -54,18 +54,10 @@ fn main() {
         run_bench("sysalloc", threads, bench_sysalloc);
         run_bench("sysalloc+touch", threads, bench_sysalloc_touch);
         run_bench("sysalloc+nohuge", threads, bench_sysalloc_nohuge);
-        run_bench(
-            "sysalloc+nohuge+touch",
-            threads,
-            bench_sysalloc_nohuge_touch,
-        );
+        run_bench("sysalloc+nohuge+touch", threads, bench_sysalloc_nohuge_touch);
         run_bench("mmap/munmap", threads, bench_mmap);
         run_bench("mmap/munmap+touch", threads, bench_mmap_touch);
-        run_bench(
-            "mmap/madvise_dontneed",
-            threads,
-            bench_mmap_madvise_dontneed,
-        );
+        run_bench("mmap/madvise_dontneed", threads, bench_mmap_madvise_dontneed);
         run_bench("mmap/madvise_free", threads, bench_mmap_madvise_free);
         println!();
     }
