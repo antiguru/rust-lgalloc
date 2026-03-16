@@ -537,10 +537,47 @@ impl LocalSizeClass {
     }
 }
 
-/// Create an anonymous memory mapping with huge page hints.
+/// Create an anonymous memory mapping with huge/super page hints.
+///
+/// On Linux, applies `MADV_HUGEPAGE` for transparent huge pages.
+/// On macOS, requests 2 MiB superpages via `VM_FLAGS_SUPERPAGE_SIZE_2MB` when the
+/// allocation is a multiple of 2 MiB, falling back to regular pages on failure.
 ///
 /// Returns a tuple of `(address, mutable slice)` on success.
 fn mmap_anonymous(len: usize) -> Result<(usize, &'static mut [u8]), AllocError> {
+    // On macOS, try superpage allocation for 2 MiB-aligned sizes.
+    #[cfg(target_os = "macos")]
+    {
+        const SUPERPAGE_2MB: usize = 2 << 20;
+        if len >= SUPERPAGE_2MB && len % SUPERPAGE_2MB == 0 {
+            // VM_FLAGS_SUPERPAGE_SIZE_2MB = 0x40000, passed via the fd parameter.
+            const VM_FLAGS_SUPERPAGE_SIZE_2MB: libc::c_int = 0x40000;
+            // SAFETY: Creating an anonymous private mapping with superpage hint.
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    VM_FLAGS_SUPERPAGE_SIZE_2MB,
+                    0,
+                )
+            };
+            if ptr != libc::MAP_FAILED {
+                // SAFETY: `ptr` is a valid mapping of `len` bytes.
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) };
+                return Ok((ptr as usize, slice));
+            }
+            // Superpage allocation failed — fall through to regular mapping.
+            if !MADV_HUGEPAGE_WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "lgalloc: superpage allocation failed: {}. Falling back to regular pages.",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
     // SAFETY: Creating an anonymous private mapping with no file descriptor.
     let ptr = unsafe {
         libc::mmap(

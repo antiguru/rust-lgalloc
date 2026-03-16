@@ -104,7 +104,7 @@ Each area can back multiple regions.
 * Fixed-size areas could allow us to move areas between size classes.
 * Reference-counting can determine when an area isn't referenced anymore, although this is not
   trivial because it's a lock-free system.
-* Support superpages on macOS (`VM_FLAGS_SUPERPAGE_SIZE_2MB` via `mach/vm_statistics.h`).
+* Superpage support on macOS is untested (uses `VM_FLAGS_SUPERPAGE_SIZE_2MB` with fallback).
 
 #### License
 
