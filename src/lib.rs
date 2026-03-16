@@ -99,34 +99,55 @@ impl Handle {
         unsafe { self.madvise(libc::MADV_DONTNEED) }
     }
 
-    /// Hint to the kernel that a byte range within this allocation will be needed soon.
+    /// Hint to the kernel that a range of elements will be needed soon.
     ///
-    /// Issues `MADV_WILLNEED` to initiate asynchronous page-in for the range
-    /// `[offset, offset + len)`, which is especially useful when pages may reside in
-    /// swap. The kernel begins reading pages in the background; a subsequent access to
-    /// a prefetched page will either find it already resident or wait for a shorter I/O.
+    /// Issues `MADV_WILLNEED` to initiate asynchronous page-in for elements
+    /// `range.start..range.end` of type `T`, which is especially useful when pages may
+    /// reside in swap. The kernel begins reading pages in the background; a subsequent
+    /// access to a prefetched page will either find it already resident or wait for a
+    /// shorter I/O.
     ///
-    /// `offset` and `len` do not need to be page-aligned — the kernel rounds to page
-    /// boundaries internally.
+    /// `T` should match the element type used with [`allocate`]. Use `u8` for
+    /// byte-granularity prefetch.
+    ///
+    /// The resulting byte range does not need to be page-aligned — the kernel rounds
+    /// to page boundaries internally.
     ///
     /// This is a performance hint and never affects correctness. The kernel may ignore
     /// it under memory pressure. Calling it on already-resident pages is a no-op.
     ///
     /// # Errors
     ///
-    /// Returns [`AllocError::OutOfMemory`] if `offset + len` exceeds the allocation length.
-    pub fn prefetch(&self, offset: usize, len: usize) -> Result<(), AllocError> {
-        if len == 0 || self.is_dangling() {
+    /// Returns [`PrefetchError::OutOfBounds`] if the byte range exceeds the allocation length.
+    pub fn prefetch<T>(&self, range: Range<usize>) -> Result<(), PrefetchError> {
+        let elem_size = std::mem::size_of::<T>();
+        let byte_offset = range.start.checked_mul(elem_size);
+        let byte_len = (range.end - range.start).checked_mul(elem_size);
+        let (byte_offset, byte_len) = match (byte_offset, byte_len) {
+            (Some(o), Some(l)) => (o, l),
+            _ => {
+                return Err(PrefetchError::OutOfBounds {
+                    byte_offset: range.start.saturating_mul(elem_size),
+                    byte_len: range.len().saturating_mul(elem_size),
+                    allocation_len: self.len,
+                });
+            }
+        };
+        if byte_len == 0 || self.is_dangling() {
             return Ok(());
         }
-        if offset.saturating_add(len) > self.len {
-            return Err(AllocError::OutOfMemory);
+        if byte_offset.saturating_add(byte_len) > self.len {
+            return Err(PrefetchError::OutOfBounds {
+                byte_offset,
+                byte_len,
+                allocation_len: self.len,
+            });
         }
         // SAFETY: MADV_WILLNEED is a hint that never modifies memory contents.
         // The pointer arithmetic is in-bounds per the check above.
         unsafe {
-            let ptr = self.as_non_null().as_ptr().add(offset);
-            libc::madvise(ptr.cast(), len, libc::MADV_WILLNEED);
+            let ptr = self.as_non_null().as_ptr().add(byte_offset);
+            libc::madvise(ptr.cast(), byte_len, libc::MADV_WILLNEED);
         }
         Ok(())
     }
@@ -152,7 +173,7 @@ impl Handle {
 const INITIAL_SIZE: usize = 32 << 20;
 
 /// Range of valid size classes.
-pub const VALID_SIZE_CLASS: Range<usize> = 20..37;
+pub const VALID_SIZE_CLASS: Range<usize> = 21..37;
 
 /// Strategy for background worker clear: `MADV_FREE` on Linux (lazy reclaim), `MADV_DONTNEED` elsewhere.
 #[cfg(target_os = "linux")]
@@ -185,6 +206,21 @@ pub enum AllocError {
     /// Failed to allocate memory that suits alignment properties.
     #[error("Memory unsuitable for requested alignment")]
     UnalignedMemory,
+}
+
+/// Errors from [`Handle::prefetch`].
+#[derive(Error, Debug)]
+pub enum PrefetchError {
+    /// The requested byte range exceeds the allocation.
+    #[error("prefetch byte range [{byte_offset}..{end}) exceeds allocation length {allocation_len}", end = byte_offset + byte_len)]
+    OutOfBounds {
+        /// Byte offset of the requested range.
+        byte_offset: usize,
+        /// Byte length of the requested range.
+        byte_len: usize,
+        /// Total byte length of the allocation.
+        allocation_len: usize,
+    },
 }
 
 impl AllocError {
@@ -270,7 +306,7 @@ static LOCAL_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(32 << 20);
 
 /// Type maintaining the global state for each size class.
 struct GlobalStealer {
-    /// State for each size class. An entry at position `x` handle size class `x`, which is areas
+    /// State for each size class. An entry at position `x` handles size class `x`, which is areas
     /// of size `1<<x`.
     size_classes: Vec<SizeClassState>,
     /// Shared token to access background thread.
@@ -441,7 +477,7 @@ impl LocalSizeClass {
     /// Get a memory area. Tries to get a region from the local cache, before obtaining data from
     /// the global state. As a last option, obtains memory from other workers.
     ///
-    /// Returns [`AllcError::OutOfMemory`] if all pools are empty.
+    /// Returns [`AllocError::OutOfMemory`] if all pools are empty.
     #[inline]
     fn get(&self) -> Result<Handle, AllocError> {
         self.worker
@@ -555,7 +591,7 @@ impl LocalSizeClass {
             .map(|chunk| NonNull::new(chunk.as_mut_ptr()).expect("non-null"));
 
         // Capture first region to return immediately.
-        let ptr = chunks.next().expect("At least once chunk allocated.");
+        let ptr = chunks.next().expect("At least one chunk allocated.");
         let mem = Handle::new(ptr, self.size_class.byte_size());
 
         // Stash remaining in the injector.
@@ -928,8 +964,8 @@ impl LgAlloc {
 
 /// Determine global statistics per size class.
 ///
-/// This function is supposed to be relatively fast. It causes some syscalls, but they
-/// should be cheap.
+/// This function is relatively fast. It reads atomic counters and lock-free queue lengths
+/// without issuing syscalls.
 ///
 /// Note that this function takes a read lock on various structures, which can block refills
 /// until the function returns.

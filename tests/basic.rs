@@ -80,7 +80,7 @@ fn cross_thread_dealloc() -> Result<(), AllocError> {
         enabled: Some(true),
         ..Default::default()
     });
-    let r = <Wrapper<u8>>::allocate(1 << 20)?;
+    let r = <Wrapper<u8>>::allocate(2 << 20)?;
 
     let thread = std::thread::spawn(move || drop(r));
 
@@ -112,7 +112,7 @@ fn zero_capacity_nonzst() -> Result<(), AllocError> {
 #[test]
 fn stats() -> Result<(), AllocError> {
     initialize();
-    let (_ptr, _cap, handle) = allocate::<usize>(1 << 17)?;
+    let (_ptr, _cap, handle) = allocate::<usize>(1 << 18)?;
     deallocate(handle);
 
     let stats = lgalloc_stats();
@@ -128,20 +128,26 @@ fn prefetch() -> Result<(), AllocError> {
     let (ptr, cap, handle) = allocate::<u8>(2 << 20)?;
 
     // Prefetch the whole region.
-    handle.prefetch(0, cap)?;
+    handle.prefetch::<u8>(0..cap).unwrap();
 
     // Prefetch a sub-range (first 64 KiB).
-    handle.prefetch(0, 64 * 1024)?;
+    handle.prefetch::<u8>(0..64 * 1024).unwrap();
 
     // Prefetch an interior offset.
-    handle.prefetch(4096, 4096)?;
+    handle.prefetch::<u8>(4096..8192).unwrap();
 
-    // Zero-length is a no-op.
-    handle.prefetch(0, 0)?;
+    // Empty range is a no-op.
+    handle.prefetch::<u8>(0..0).unwrap();
 
     // Out of bounds returns an error.
-    assert!(handle.prefetch(0, cap + 1).is_err());
-    assert!(handle.prefetch(cap, 1).is_err());
+    assert!(handle.prefetch::<u8>(0..cap + 1).is_err());
+    assert!(handle.prefetch::<u8>(cap..cap + 1).is_err());
+
+    // Typed prefetch: element indices.
+    let elem_cap = cap / std::mem::size_of::<u64>();
+    handle.prefetch::<u64>(0..elem_cap).unwrap();
+    handle.prefetch::<u64>(100..200).unwrap();
+    assert!(handle.prefetch::<u64>(0..elem_cap + 1).is_err());
 
     // Verify the memory is accessible.
     let slice = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), cap) };
