@@ -8,12 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.0](https://github.com/antiguru/rust-lgalloc/compare/v0.6.0...v0.7.0) - 2026-03-16
 
+### Breaking changes
+
+* Replace file-backed memory mappings with `MAP_ANONYMOUS` + `MADV_HUGEPAGE`.
+  Allocations now use anonymous mappings with transparent huge page hints instead
+  of memory-mapped temporary files. ([#67](https://github.com/antiguru/rust-lgalloc/pull/67))
+* Remove `LgAlloc::path`, `LgAlloc::with_path()`, and `LgAlloc::file_growth_dampener()`.
+  Use `LgAlloc::growth_dampener()` instead.
+* Remove `FileStats`, `MapStats`, and `lgalloc_stats_with_mapping()`.
+  `lgalloc_stats()` is the only stats function.
+* Remove `LgAllocStats::file` and `LgAllocStats::map` fields.
+* Raise minimum size class from 2^10 (1 KiB) to 2^21 (2 MiB), matching one huge page.
+* `Handle::prefetch` now takes a typed element range (`prefetch::<T>(Range<usize>)`)
+  and returns `PrefetchError` instead of `AllocError`.
+
+### Added
+
+* `Handle::prefetch::<T>(Range<usize>)` for typed prefetch hints via `MADV_WILLNEED`.
+* `PrefetchError` type for prefetch-specific errors.
+* `munmap` on `GlobalStealer::drop` to return virtual address space on shutdown.
+* Graceful handling of `MADV_HUGEPAGE` failure (one-time warning instead of error).
+* Allocation benchmarks comparing lgalloc, system allocator, and raw mmap.
+
+### Fixed
+
+* Use `MADV_FREE` (Linux) / `MADV_DONTNEED` (other) for background clear instead of
+  `MADV_REMOVE`, which fails on anonymous memory.
+
+### Removed
+
+* `numa_maps`, `memmap2`, `tempfile`, `serial_test` dependencies.
+
 ### Other
 
-- Update README version in release PRs ([#68](https://github.com/antiguru/rust-lgalloc/pull/68))
-- Replace file-backed mappings with anonymous + THP ([#67](https://github.com/antiguru/rust-lgalloc/pull/67))
-- Bump actions/checkout from 5 to 6 ([#66](https://github.com/antiguru/rust-lgalloc/pull/66))
-- Bump actions/checkout from 4 to 5 ([#64](https://github.com/antiguru/rust-lgalloc/pull/64))
+* Move tests to integration test files.
+* Rewrite README with structured sections.
+* Update release-plz workflow to patch README version automatically ([#68](https://github.com/antiguru/rust-lgalloc/pull/68)).
 
 ## [0.6.0](https://github.com/antiguru/rust-lgalloc/compare/v0.5.0...v0.6.0) - 2025-05-27
 
