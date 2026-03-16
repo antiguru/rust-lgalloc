@@ -35,8 +35,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let run_paging = args.iter().any(|a| a == "--paging");
     let run_ratio_sweep = args.iter().any(|a| a == "--ratio-sweep");
-    let total_mib: Option<usize> = parse_arg_value(&args, "--total-mib")
-        .and_then(|v| v.parse().ok());
+    let total_mib: Option<usize> =
+        parse_arg_value(&args, "--total-mib").and_then(|v| v.parse().ok());
 
     // Initialize lgalloc once.
     lgalloc::lgalloc_set_config(
@@ -68,10 +68,18 @@ fn main() {
         run_bench("sysalloc", threads, bench_sysalloc);
         run_bench("sysalloc+touch", threads, bench_sysalloc_touch);
         run_bench("sysalloc+nohuge", threads, bench_sysalloc_nohuge);
-        run_bench("sysalloc+nohuge+touch", threads, bench_sysalloc_nohuge_touch);
+        run_bench(
+            "sysalloc+nohuge+touch",
+            threads,
+            bench_sysalloc_nohuge_touch,
+        );
         run_bench("mmap/munmap", threads, bench_mmap);
         run_bench("mmap/munmap+touch", threads, bench_mmap_touch);
-        run_bench("mmap/madvise_dontneed", threads, bench_mmap_madvise_dontneed);
+        run_bench(
+            "mmap/madvise_dontneed",
+            threads,
+            bench_mmap_madvise_dontneed,
+        );
         run_bench("mmap/madvise_free", threads, bench_mmap_madvise_free);
         println!();
     }
@@ -496,7 +504,15 @@ fn run_random_read(
     }
     let elapsed = start.elapsed();
     let hist = shared_hist.combined();
-    print_result(name, threads, mem_limit, total_bytes, ratio_label, elapsed, &hist);
+    print_result(
+        name,
+        threads,
+        mem_limit,
+        total_bytes,
+        ratio_label,
+        elapsed,
+        &hist,
+    );
 }
 
 /// Random read with a dedicated prefetch thread that runs `distance` pages ahead
@@ -579,7 +595,15 @@ fn run_prefetch_read(
     }
     let elapsed = start.elapsed();
     let hist = shared_hist.combined();
-    print_result(name, threads, mem_limit, total_bytes, ratio_label, elapsed, &hist);
+    print_result(
+        name,
+        threads,
+        mem_limit,
+        total_bytes,
+        ratio_label,
+        elapsed,
+        &hist,
+    );
 }
 
 /// Batch prefetch: WILLNEED `batch_size` pages, then read them all, measure total.
@@ -646,7 +670,15 @@ fn run_batch_prefetch_read(
     }
     let elapsed = start.elapsed();
     let hist = shared_hist.combined();
-    print_result(name, threads, mem_limit, total_bytes, ratio_label, elapsed, &hist);
+    print_result(
+        name,
+        threads,
+        mem_limit,
+        total_bytes,
+        ratio_label,
+        elapsed,
+        &hist,
+    );
 }
 
 // --- Ratio sweep benchmark ---
@@ -856,7 +888,13 @@ fn bench_ratio_sweep(total_mib: Option<usize>) {
         let elapsed = start.elapsed();
         let hist = shared_hist.combined();
         print_result(
-            "realloc_touch", 1, mem_limit, total_bytes, &ratio_label, elapsed, &hist,
+            "realloc_touch",
+            1,
+            mem_limit,
+            total_bytes,
+            &ratio_label,
+            elapsed,
+            &hist,
         );
     }
 
@@ -869,9 +907,7 @@ fn bench_ratio_sweep(total_mib: Option<usize>) {
 fn bench_paging(total_mib: Option<usize>) {
     // Read cgroup memory limit to determine how much RAM we have.
     let mem_limit = read_cgroup_memory_limit().unwrap_or(512 << 20);
-    let total_bytes = total_mib
-        .map(|m| m << 20)
-        .unwrap_or(mem_limit * 3);
+    let total_bytes = total_mib.map(|m| m << 20).unwrap_or(mem_limit * 3);
     let num_regions = total_bytes / REGION_SIZE;
 
     println!("=== Paging benchmark ===");

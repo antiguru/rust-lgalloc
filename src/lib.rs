@@ -162,6 +162,7 @@ const MADV_CLEAR_STRATEGY: libc::c_int = libc::MADV_FREE;
 const MADV_CLEAR_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
 
 /// Whether we have already warned about `MADV_HUGEPAGE` failure.
+#[cfg(target_os = "linux")]
 static MADV_HUGEPAGE_WARNED: AtomicBool = AtomicBool::new(false);
 
 type PhantomUnsyncUnsend<T> = PhantomData<*mut T>;
@@ -717,7 +718,6 @@ pub fn deallocate(handle: Handle) {
     }
     thread_context(|s| s.deallocate(handle));
 }
-
 
 /// A background worker that performs periodic tasks.
 struct BackgroundWorker {
