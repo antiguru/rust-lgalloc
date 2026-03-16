@@ -6,7 +6,7 @@ We spell it `lgalloc` and pronounce it el-gee-alloc.
 
 ```toml
 [dependencies]
-lgalloc = "0.7"
+lgalloc = "0.6"
 ```
 
 ## Example
