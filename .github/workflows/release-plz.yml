@@ -9,6 +9,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+
 jobs:
   release-plz:
     name: Release-plz
@@ -21,7 +25,42 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Run release-plz
+        id: release-plz
         uses: MarcoIeni/release-plz-action@v0.5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Update README version
+        if: steps.release-plz.outputs.prs != '[]'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Extract the release PR branch from release-plz output (created or updated).
+          PR_JSON='${{ steps.release-plz.outputs.prs }}'
+          BRANCH=$(echo "$PR_JSON" | jq -r '.[0].head_branch')
+          if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
+            echo "No release PR branch found, skipping."
+            exit 0
+          fi
+
+          git fetch origin "$BRANCH"
+          git checkout "$BRANCH"
+
+          # Read the version from Cargo.toml (already bumped by release-plz).
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # Extract major.minor for the dependency line.
+          MAJOR_MINOR=$(echo "$VERSION" | sed 's/\([0-9]*\.[0-9]*\).*/\1/')
+
+          echo "Updating README.md to lgalloc = \"$MAJOR_MINOR\""
+          sed -i "s/lgalloc = \"[0-9]*\.[0-9]*\"/lgalloc = \"$MAJOR_MINOR\"/" README.md
+
+          if git diff --quiet README.md; then
+            echo "README.md already up to date."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "Update README dependency version to $MAJOR_MINOR"
+          git push origin "$BRANCH"
