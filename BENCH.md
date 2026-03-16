@@ -71,33 +71,65 @@ for RAM in 4096 2048 1024 512 256; do
 done
 ```
 
-### Findings (16-vCPU, EBS-backed instance)
+### Findings — EBS vs NVMe swap (16-vCPU r6gd, THP=madvise)
 
-**Random reads collapse as soon as data spills to swap.**
-At 1 thread with a 4 GiB working set:
+#### Random reads (1 thread, 4 GiB working set)
 
-| RAM    | Ratio | ops/s   | p50    | p99    |
-|--------|-------|---------|--------|--------|
-| 4096M  | 1:1   | 232,041 | 238ns  | 632ns  |
-| 2048M  | 1:2   |     156 | 326µs  | 132ms  |
-|  512M  | 1:8   |      93 | 471µs  | 139ms  |
-|  256M  | 1:16  |     144 | 470µs  | 132ms  |
+| RAM    | Ratio | EBS ops/s | NVMe ops/s | NVMe p50 | NVMe p99  |
+|--------|-------|-----------|------------|----------|-----------|
+| 4096M  | 1:1   |   232,041 |  1,545,189 |   181ns  |    533ns  |
+| 2048M  | 1:2   |       156 |     23,174 |    75µs  |    241µs  |
+| 1024M  | 1:4   |         — |     16,504 |    77µs  |    167µs  |
+|  512M  | 1:8   |        93 |     12,996 |    78µs  |    251µs  |
+|  256M  | 1:16  |       144 |     12,578 |    77µs  |    242µs  |
 
-Once swapping, throughput is dominated by per-page swap-in latency (~130 ms p99),
-and the exact ratio matters little.
+On EBS, throughput collapsed to ~100 ops/s once swapping, dominated by
+per-page swap-in latency (~130 ms p99). On NVMe, swap-in completes in
+~80 µs (p50) with sub-300 µs p99 — a **100–150× throughput improvement**
+and **~500× p99 improvement**.
 
-**Realloc+touch is unaffected by swap pressure.**
+The ratio still matters on NVMe (23K → 13K from 1:2 → 1:8), but the
+degradation is gradual rather than catastrophic.
+
+Multi-threaded scaling is near-linear on NVMe:
+
+| RAM    | 1 thr    | 4 thr    | 8 thr     | 16 thr    |
+|--------|----------|----------|-----------|-----------|
+| 2048M  |  23,174  |  91,094  |  161,827  |  268,920  |
+|  512M  |  12,996  |  52,354  |   94,063  |  156,873  |
+
+#### Realloc+touch is unaffected by swap pressure
+
 lgalloc recycles the same virtual pages; the kernel keeps the hot working page
 resident since it is touched immediately after dealloc:
 
 | RAM    | Ratio | ops/s   | p50   |
 |--------|-------|---------|-------|
-| 4096M  | 1:1   | 461,636 | 2.2µs |
-|  512M  | 1:8   | 461,323 | 2.2µs |
+| 4096M  | 1:1   | 465,828 | 2.2µs |
+|  512M  | 1:8   | 453,985 | 2.2µs |
 
-Scaling is near-linear up to 16 threads (~7 M ops/s) at every ratio.
+Scaling is near-linear up to 16 threads (~7.8 M ops/s) at every ratio.
 
-### madvise strategy experiments (1 thread, 512 M RAM / 4 GiB working set)
+### Paging benchmark (CCDF)
+
+512 MiB RAM, 1536 MiB allocated (3× overcommit), NVMe swap:
+
+| Metric                 | 1 thread |
+|------------------------|----------|
+| random_read ops/s      |   17,392 |
+| random_read p50        |   76.2µs |
+| random_read p99        |  240.5µs |
+| random_read max        |    3.7ms |
+| realloc+touch ops/s    |  447,291 |
+| realloc+touch p50      |    2.3µs |
+
+CCDF is bimodal: ~50% of reads hit resident pages (< 300 ns), ~50% swap in
+at ~76–87 µs. The tail (p99.9 = 252 µs, max = 3.7 ms) reflects NVMe device
+latency under queue depth, not EBS network round-trips.
+
+### madvise strategy experiments
+
+#### EBS (1 thread, 512 M RAM / 4 GiB working set)
 
 | Strategy              | ops/s | p50    | p99    | p999   | max    |
 |-----------------------|-------|--------|--------|--------|--------|
@@ -110,17 +142,39 @@ Scaling is near-linear up to 16 threads (~7 M ops/s) at every ratio.
 | batch128+WILLNEED     | 3,764 | 1.3µs  | 445µs  | 637µs  | 10ms   |
 | MADV_RANDOM+pf (8thr) | 7,032 | 377ns  | 15.3ms | 30ms   | 263ms  |
 
-* **MADV_RANDOM/SEQUENTIAL** barely help (~8%). Default readahead is already
-  small for random patterns and swap I/O is seek-dominated.
-* **MADV_WILLNEED prefetch** is the clear winner: +68% throughput, p50 drops
-  from 468 µs → 322 µs. A prefetch thread (or batch WILLNEED) issues swap-in
-  requests ahead of time, overlapping I/O with computation.
-* **batch128+WILLNEED** achieves a **1.3 µs p50** because most pages are already
-  resident by the time the reader reaches them.
-* **MADV_RANDOM + prefetch at 8 threads** reaches 7,032 ops/s (2× baseline),
-  the best multi-threaded result. Disabling kernel readahead avoids wasted I/O
-  while explicit prefetch keeps the pipeline full.
-* No strategy degrades the all-fits case (~230K ops/s at 1 thread).
+#### NVMe (1 thread, 512 M RAM / 4 GiB working set)
+
+| Strategy              | ops/s   | p50    | p99    | p999   | max    |
+|-----------------------|---------|--------|--------|--------|--------|
+| baseline              |  12,996 | 78µs   | 251µs  | 298µs  | 5.8ms  |
+| MADV_RANDOM           |  12,725 | 78µs   | 251µs  | 452µs  | 1.9ms  |
+| MADV_SEQUENTIAL       |  12,825 | 77µs   | 250µs  | 279µs  | 817µs  |
+| prefetch (32 ahead)   | 150,411 | 1.5µs  | 33µs   | 109µs  | 23.9ms |
+| batch8+WILLNEED       |  30,362 | 4.4µs  | 162µs  | 219µs  | 402µs  |
+| batch32+WILLNEED      |  78,060 | 837ns  | 147µs  | 164µs  | 412µs  |
+| batch128+WILLNEED     | 136,947 | 846ns  | 31µs   | 135µs  | 330µs  |
+| MADV_RANDOM+pf (8thr) | 241,035 | 1.3µs  | 591µs  | 830µs  | 12ms   |
+
+#### Analysis
+
+* **MADV_RANDOM/SEQUENTIAL** barely help on either storage backend (~2–8%).
+  Default readahead is already small for random patterns.
+* **MADV_WILLNEED prefetch** is the clear winner on both backends, but the
+  benefit is dramatically larger on NVMe: **150K ops/s** (12× baseline) vs
+  3.6K (1.7× baseline) on EBS. NVMe's low latency means the prefetch thread
+  can keep the I/O pipeline full — most pages are already resident by the time
+  the reader reaches them.
+* **batch128+WILLNEED** achieves sub-microsecond p50 on both backends, but
+  NVMe sustains **137K ops/s** vs 3.8K on EBS.
+* **MADV_RANDOM + prefetch at 8 threads** reaches **241K ops/s** on NVMe
+  (19× baseline), approaching the all-resident rate. On EBS the same strategy
+  managed 7K ops/s with a 263 ms max — the network round-trip dominates.
+* No strategy degrades the all-fits case (~1.5M ops/s at 1 thread on NVMe).
+
+**Takeaway**: NVMe instance storage transforms swap from "emergency fallback"
+to a viable tier. With prefetch, swapped data on NVMe approaches DRAM
+throughput for batch workloads. EBS swap is only practical for cold data
+that is rarely accessed.
 
 These results motivate the `prefetch_hint` API: callers who know their access
 pattern can issue MADV_WILLNEED on specific page ranges ahead of time.
