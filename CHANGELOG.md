@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/antiguru/rust-lgalloc/compare/v0.6.0...v0.7.0) - 2026-03-16
+
+### Other
+
+- Update README version in release PRs ([#68](https://github.com/antiguru/rust-lgalloc/pull/68))
+- Replace file-backed mappings with anonymous + THP ([#67](https://github.com/antiguru/rust-lgalloc/pull/67))
+- Bump actions/checkout from 5 to 6 ([#66](https://github.com/antiguru/rust-lgalloc/pull/66))
+- Bump actions/checkout from 4 to 5 ([#64](https://github.com/antiguru/rust-lgalloc/pull/64))
+
 ## [0.6.0](https://github.com/antiguru/rust-lgalloc/compare/v0.5.0...v0.6.0) - 2025-05-27
 
 ### Other
