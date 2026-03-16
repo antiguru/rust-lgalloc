@@ -1,6 +1,6 @@
 [package]
 name = "lgalloc"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["Moritz Hoffmann <antiguru@gmail.com>"]
 description = "Large object allocator"
@@ -11,12 +11,15 @@ rust-version = "1.72"
 [dependencies]
 crossbeam-deque = "0.8.5"
 libc = "0.2"
-numa_maps = "0.1"
 page_size = "0.6.0"
 thiserror = "2.0"
 
 [dev-dependencies]
-serial_test = "3.2"
+hdrhistogram = "7"
+
+[[bench]]
+name = "alloc_bench"
+harness = false
 
 [profile.release]
 debug = 2

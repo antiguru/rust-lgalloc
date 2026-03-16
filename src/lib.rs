@@ -1,15 +1,18 @@
-//! A size-classed file-backed large object allocator.
+//! A size-classed large object allocator backed by anonymous mappings.
 //!
 //! This library contains types to allocate memory outside the heap,
 //! supporting power-of-two object sizes. Each size class has its own
 //! memory pool.
+//!
+//! Allocations use `MAP_ANONYMOUS` with `MADV_HUGEPAGE` hints to benefit
+//! from transparent huge pages when available.
 //!
 //! # Safety
 //!
 //! This library is very unsafe on account of `unsafe` and interacting directly
 //! with libc, including Linux extension.
 //!
-//! The library relies on memory-mapped files. Users of this file must not fork the process
+//! The library relies on anonymous memory mappings. Users must not fork the process
 //! because otherwise two processes would share the same mappings, causing undefined behavior
 //! because the mutable pointers would not be unique anymore. Unfortunately, there is no way
 //! to tell the memory subsystem that the shared mappings must not be inherited.
@@ -24,7 +27,6 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::{take, ManuallyDrop};
 use std::ops::Range;
-use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -33,7 +35,6 @@ use std::thread::{JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
-use numa_maps::NumaMap;
 use thiserror::Error;
 
 mod readme {
@@ -83,13 +84,16 @@ impl Handle {
         self.ptr
     }
 
-    /// Indicate that the memory is not in use and that the OS can recycle it.
+    /// Indicate that the memory is not in use and that the OS can lazily recycle it.
+    ///
+    /// Uses `MADV_FREE` on Linux (lazy reclaim, avoids immediate page zeroing) and
+    /// `MADV_DONTNEED` elsewhere.
     fn clear(&mut self) -> std::io::Result<()> {
-        // SAFETY: `MADV_DONTNEED_STRATEGY` guaranteed to be a valid argument.
-        unsafe { self.madvise(MADV_DONTNEED_STRATEGY) }
+        // SAFETY: `MADV_CLEAR_STRATEGY` guaranteed to be a valid argument.
+        unsafe { self.madvise(MADV_CLEAR_STRATEGY) }
     }
 
-    /// Indicate that the memory is not in use and that the OS can recycle it.
+    /// Indicate that the memory is not in use and that the OS should immediately recycle it.
     fn fast_clear(&mut self) -> std::io::Result<()> {
         // SAFETY: `libc::MADV_DONTNEED` documented to be a valid argument.
         unsafe { self.madvise(libc::MADV_DONTNEED) }
@@ -100,7 +104,6 @@ impl Handle {
         // SAFETY: Calling into `madvise`:
         // * The ptr is page-aligned by construction.
         // * The ptr + length is page-aligned by construction (not required but surprising otherwise)
-        // * Mapped shared and writable (for MADV_REMOVE),
         // * Pages not locked.
         // * The caller is responsible for passing a valid `advice` parameter.
         let ptr = self.as_non_null().as_ptr().cast();
@@ -113,21 +116,21 @@ impl Handle {
     }
 }
 
-/// Initial file size
+/// Initial area size
 const INITIAL_SIZE: usize = 32 << 20;
 
 /// Range of valid size classes.
 pub const VALID_SIZE_CLASS: Range<usize> = 20..37;
 
-/// Strategy to indicate that the OS can reclaim pages
-// TODO: On Linux, we want to use MADV_REMOVE, but that's only supported
-// on file systems that supports FALLOC_FL_PUNCH_HOLE. We should check
-// the return value and retry EOPNOTSUPP with MADV_DONTNEED.
+/// Strategy for background worker clear: `MADV_FREE` on Linux (lazy reclaim), `MADV_DONTNEED` elsewhere.
 #[cfg(target_os = "linux")]
-const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_REMOVE;
+const MADV_CLEAR_STRATEGY: libc::c_int = libc::MADV_FREE;
 
 #[cfg(not(target_os = "linux"))]
-const MADV_DONTNEED_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
+const MADV_CLEAR_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
+
+/// Whether we have already warned about `MADV_HUGEPAGE` failure.
+static MADV_HUGEPAGE_WARNED: AtomicBool = AtomicBool::new(false);
 
 type PhantomUnsyncUnsend<T> = PhantomData<*mut T>;
 
@@ -223,11 +226,11 @@ static LGALLOC_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Enable eager returning of memory. Off by default.
 static LGALLOC_EAGER_RETURN: AtomicBool = AtomicBool::new(false);
 
-/// Dampener in the file growth rate. 0 corresponds to doubling and in general `n` to `1+1/(n+1)`.
+/// Dampener in the area growth rate. 0 corresponds to doubling and in general `n` to `1+1/(n+1)`.
 ///
-/// Setting this to 0 results in creating files with doubling capacity.
-/// Larger numbers result in more conservative approaches that create more files.
-static LGALLOC_FILE_GROWTH_DAMPENER: AtomicUsize = AtomicUsize::new(0);
+/// Setting this to 0 results in creating areas with doubling capacity.
+/// Larger numbers result in more conservative approaches that create more areas.
+static LGALLOC_GROWTH_DAMPENER: AtomicUsize = AtomicUsize::new(0);
 
 /// The size of allocations to retain locally, per thread and size class.
 static LOCAL_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(32 << 20);
@@ -237,8 +240,6 @@ struct GlobalStealer {
     /// State for each size class. An entry at position `x` handle size class `x`, which is areas
     /// of size `1<<x`.
     size_classes: Vec<SizeClassState>,
-    /// Path to store files
-    path: RwLock<Option<PathBuf>>,
     /// Shared token to access background thread.
     background_sender: Mutex<Option<(JoinHandle<()>, Sender<BackgroundWorkerConfig>)>>,
 }
@@ -246,7 +247,7 @@ struct GlobalStealer {
 /// Per-size-class state
 #[derive(Default)]
 struct SizeClassState {
-    /// Handle to memory-mapped regions.
+    /// Handle to anonymous memory-mapped regions.
     ///
     /// We must never dereference the memory-mapped regions stored here.
     areas: RwLock<Vec<ManuallyDrop<(usize, usize)>>>,
@@ -286,7 +287,6 @@ impl GlobalStealer {
 
         Self {
             size_classes,
-            path: RwLock::default(),
             background_sender: Mutex::default(),
         }
     }
@@ -294,6 +294,17 @@ impl GlobalStealer {
 
 impl Drop for GlobalStealer {
     fn drop(&mut self) {
+        // Unmap all areas to return virtual address space.
+        for size_class_state in &mut self.size_classes {
+            let mut areas = size_class_state.areas.write().expect("lock poisoned");
+            for area in areas.drain(..) {
+                let (addr, len) = ManuallyDrop::into_inner(area);
+                // SAFETY: `addr` and `len` were returned by `mmap` during `try_refill_and_get`.
+                unsafe {
+                    libc::munmap(addr as *mut libc::c_void, len);
+                }
+            }
+        }
         take(&mut self.size_classes);
     }
 }
@@ -485,8 +496,8 @@ impl LocalSizeClass {
 
         let last_capacity =
             stash.iter().last().map_or(0, |mmap| mmap.1) / self.size_class.byte_size();
-        let growth_dampener = LGALLOC_FILE_GROWTH_DAMPENER.load(Ordering::Relaxed);
-        // We would like to grow the file capacity by a factor of `1+1/(growth_dampener+1)`,
+        let growth_dampener = LGALLOC_GROWTH_DAMPENER.load(Ordering::Relaxed);
+        // We would like to grow the area capacity by a factor of `1+1/(growth_dampener+1)`,
         // but at least by `initial_capacity`.
         let next_capacity = last_capacity
             + std::cmp::max(
@@ -495,29 +506,8 @@ impl LocalSizeClass {
             );
 
         let next_byte_len = next_capacity * self.size_class.byte_size();
-        // let (file, mut mmap) = Self::init_file(next_byte_len)?;
 
-        let mmap = unsafe {
-            libc::mmap(std::ptr::null_mut(), next_byte_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0)
-        };
-        if mmap == libc::MAP_FAILED {
-            println!("mmap failed, length {next_byte_len}");
-            println!("mmap failed: {}", std::io::Error::last_os_error());
-            return Err(std::io::Error::last_os_error().into());
-        }
-        unsafe {
-            let ret = libc::madvise(mmap, next_byte_len, libc::MADV_HUGEPAGE);
-            if ret == -1 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        let slice = unsafe {
-            std::slice::from_raw_parts_mut(mmap.cast::<u8>(), next_byte_len)
-        };
+        let (mmap_ptr, slice) = mmap_anonymous(next_byte_len)?;
 
         self.size_class_state
             .total_bytes
@@ -542,9 +532,47 @@ impl LocalSizeClass {
                 .push(Handle::new(ptr, self.size_class.byte_size()));
         }
 
-        stash.push(ManuallyDrop::new((mmap.addr(), next_byte_len)));
+        stash.push(ManuallyDrop::new((mmap_ptr, next_byte_len)));
         Ok(mem)
     }
+}
+
+/// Create an anonymous memory mapping with huge page hints.
+///
+/// Returns a tuple of `(address, mutable slice)` on success.
+fn mmap_anonymous(len: usize) -> Result<(usize, &'static mut [u8]), AllocError> {
+    // SAFETY: Creating an anonymous private mapping with no file descriptor.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    // Hint to the kernel to use transparent huge pages. This is a performance hint,
+    // not a correctness requirement — THP may be disabled system-wide.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `ptr` is a valid mapping returned by `mmap` above.
+        let ret = unsafe { libc::madvise(ptr, len, libc::MADV_HUGEPAGE) };
+        if ret == -1 && !MADV_HUGEPAGE_WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "lgalloc: MADV_HUGEPAGE failed: {}. Transparent huge pages may be disabled.",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    // SAFETY: `ptr` is a valid mapping of `len` bytes.
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) };
+    Ok((ptr as usize, slice))
 }
 
 impl Drop for LocalSizeClass {
@@ -746,10 +774,7 @@ impl BackgroundWorker {
 /// Set or update the configuration for lgalloc.
 ///
 /// The function accepts a configuration, which is then applied on lgalloc. It allows clients to
-/// change the path where area files reside, and change the configuration of the background task.
-///
-/// Updating the area path only applies to new allocations, existing allocations are not moved to
-/// the new path.
+/// change the configuration of the background task.
 ///
 /// Updating the background thread configuration eventually applies the new configuration on the
 /// running thread, or starts the background worker.
@@ -768,12 +793,8 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
         LGALLOC_EAGER_RETURN.store(*eager_return, Ordering::Relaxed);
     }
 
-    if let Some(path) = &config.path {
-        *stealer.path.write().expect("lock poisoned") = Some(path.clone());
-    }
-
-    if let Some(file_growth_dampener) = &config.file_growth_dampener {
-        LGALLOC_FILE_GROWTH_DAMPENER.store(*file_growth_dampener, Ordering::Relaxed);
+    if let Some(growth_dampener) = &config.growth_dampener {
+        LGALLOC_GROWTH_DAMPENER.store(*growth_dampener, Ordering::Relaxed);
     }
 
     if let Some(local_buffer_bytes) = &config.local_buffer_bytes {
@@ -818,14 +839,12 @@ pub struct BackgroundWorkerConfig {
 pub struct LgAlloc {
     /// Whether the allocator is enabled or not.
     pub enabled: Option<bool>,
-    /// Path where files reside.
-    pub path: Option<PathBuf>,
     /// Configuration of the background worker.
     pub background_config: Option<BackgroundWorkerConfig>,
     /// Whether to return physical memory on deallocate
     pub eager_return: Option<bool>,
-    /// Dampener in the file growth rate. 0 corresponds to doubling and in general `n` to `1+1/(n+1)`.
-    pub file_growth_dampener: Option<usize>,
+    /// Dampener in the area growth rate. 0 corresponds to doubling and in general `n` to `1+1/(n+1)`.
+    pub growth_dampener: Option<usize>,
     /// Size of the per-thread per-size class cache, in bytes.
     pub local_buffer_bytes: Option<usize>,
 }
@@ -855,21 +874,15 @@ impl LgAlloc {
         self
     }
 
-    /// Set the area file path.
-    pub fn with_path(&mut self, path: PathBuf) -> &mut Self {
-        self.path = Some(path);
-        self
-    }
-
     /// Enable eager memory reclamation.
     pub fn eager_return(&mut self, eager_return: bool) -> &mut Self {
         self.eager_return = Some(eager_return);
         self
     }
 
-    /// Set the file growth dampener.
-    pub fn file_growth_dampener(&mut self, file_growth_dapener: usize) -> &mut Self {
-        self.file_growth_dampener = Some(file_growth_dapener);
+    /// Set the area growth dampener.
+    pub fn growth_dampener(&mut self, growth_dampener: usize) -> &mut Self {
+        self.growth_dampener = Some(growth_dampener);
         self
     }
 
@@ -883,35 +896,28 @@ impl LgAlloc {
 /// Determine global statistics per size class.
 ///
 /// This function is supposed to be relatively fast. It causes some syscalls, but they
-/// should be cheap (stat on a file descriptor).
+/// should be cheap.
 ///
-/// Note that this function take a read lock on various structures. It calls `fstat` while
-/// holding a read lock on portions of the global state, which can block refills until the
-/// function returns.
+/// Note that this function takes a read lock on various structures, which can block refills
+/// until the function returns.
 ///
 /// # Panics
 ///
 /// Panics if the internal state of lgalloc is corrupted.
 pub fn lgalloc_stats() -> LgAllocStats {
-    LgAllocStats::read(None)
-}
+    let global = GlobalStealer::get_static();
 
-/// Determine global statistics per size class, and include mapping information.
-///
-/// This function can be very slow as it needs to read the `numa_maps` file. Depending
-/// on the heap size of the program, this can take seconds to minutes, so call this
-/// function with care.
-///
-/// Note that this function take a read lock on various structures. In addition to the locks
-/// described on [`lgalloc_stats`], this function reads the `/proc/self/numa_maps` file without
-/// holding any locks, but the kernel might block other memory operations while reading this file.
-///
-/// # Panics
-///
-/// Panics if the internal state of lgalloc is corrupted.
-pub fn lgalloc_stats_with_mapping() -> std::io::Result<LgAllocStats> {
-    let mut numa_map = NumaMap::from_file("/proc/self/numa_maps")?;
-    Ok(LgAllocStats::read(Some(&mut numa_map)))
+    let mut size_class_stats = Vec::with_capacity(VALID_SIZE_CLASS.len());
+    for (index, state) in global.size_classes.iter().enumerate() {
+        let size_class = SizeClass::from_index(index);
+        let size_class_bytes = size_class.byte_size();
+
+        size_class_stats.push((size_class_bytes, SizeClassStats::from(state)));
+    }
+
+    LgAllocStats {
+        size_class: size_class_stats,
+    }
 }
 
 /// Statistics about lgalloc's internal behavior.
@@ -919,40 +925,6 @@ pub fn lgalloc_stats_with_mapping() -> std::io::Result<LgAllocStats> {
 pub struct LgAllocStats {
     /// Per size-class statistics.
     pub size_class: Vec<(usize, SizeClassStats)>,
-    /// Per size-class and map statistics. Each entry identifies the
-    /// size class it describes, and there can be multiple entries for each size class.
-    pub map: Option<Vec<(usize, MapStats)>>,
-}
-
-impl LgAllocStats {
-    /// Read lgalloc statistics.
-    ///
-    /// Supply a `numa_map` to obtain mapping stats.
-    fn read(mut numa_map: Option<&mut NumaMap>) -> Self {
-        let global = GlobalStealer::get_static();
-
-        if let Some(numa_map) = numa_map.as_mut() {
-            // Normalize numa_maps, and sort by address.
-            for entry in &mut numa_map.ranges {
-                entry.normalize();
-            }
-            numa_map.ranges.sort();
-        }
-
-        let mut size_class_stats = Vec::with_capacity(VALID_SIZE_CLASS.len());
-        let map_stats = Vec::default();
-        for (index, state) in global.size_classes.iter().enumerate() {
-            let size_class = SizeClass::from_index(index);
-            let size_class_bytes = size_class.byte_size();
-
-            size_class_stats.push((size_class_bytes, SizeClassStats::from(state)));
-        }
-
-        Self {
-            size_class: size_class_stats,
-            map: numa_map.map(|_| map_stats),
-        }
-    }
 }
 
 /// Statistics per size class.
@@ -1032,238 +1004,5 @@ impl From<&SizeClassState> for SizeClassStats {
             clear_eager_total,
             clear_slow_total,
         }
-    }
-}
-
-/// Statistics per size class and mapping.
-#[derive(Debug)]
-pub struct MapStats {
-    /// Number of mapped bytes, if different from `dirty`. Consult `man 7 numa` for details.
-    pub mapped: usize,
-    /// Number of active bytes. Consult `man 7 numa` for details.
-    pub active: usize,
-    /// Number of dirty bytes. Consult `man 7 numa` for details.
-    pub dirty: usize,
-}
-
-#[cfg(test)]
-mod test {
-    use std::mem::{ManuallyDrop, MaybeUninit};
-    use std::ptr::NonNull;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use serial_test::serial;
-
-    use super::*;
-
-    fn initialize() {
-        lgalloc_set_config(
-            LgAlloc::new()
-                .enable()
-                .with_background_config(BackgroundWorkerConfig {
-                    interval: Duration::from_secs(1),
-                    clear_bytes: 4 << 20,
-                })
-                .with_path(std::env::temp_dir())
-                .file_growth_dampener(1),
-        );
-    }
-
-    struct Wrapper<T> {
-        handle: MaybeUninit<Handle>,
-        ptr: NonNull<MaybeUninit<T>>,
-        cap: usize,
-    }
-
-    unsafe impl<T: Send> Send for Wrapper<T> {}
-    unsafe impl<T: Sync> Sync for Wrapper<T> {}
-
-    impl<T> Wrapper<T> {
-        fn allocate(capacity: usize) -> Result<Self, AllocError> {
-            let (ptr, cap, handle) = allocate(capacity)?;
-            assert!(cap > 0);
-            let handle = MaybeUninit::new(handle);
-            Ok(Self { ptr, cap, handle })
-        }
-
-        fn as_slice(&mut self) -> &mut [MaybeUninit<T>] {
-            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) }
-        }
-    }
-
-    impl<T> Drop for Wrapper<T> {
-        fn drop(&mut self) {
-            unsafe { deallocate(self.handle.assume_init_read()) };
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_readme() -> Result<(), AllocError> {
-        initialize();
-
-        // Allocate memory
-        let (ptr, cap, handle) = allocate::<u8>(2 << 20)?;
-        // SAFETY: `allocate` returns a valid memory region and errors otherwise.
-        let mut vec = ManuallyDrop::new(unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, cap) });
-
-        // Write into region, make sure not to reallocate vector.
-        vec.extend_from_slice(&[1, 2, 3, 4]);
-
-        // We can read from the vector.
-        assert_eq!(&*vec, &[1, 2, 3, 4]);
-
-        // Deallocate after use
-        deallocate(handle);
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_1() -> Result<(), AllocError> {
-        initialize();
-        <Wrapper<u8>>::allocate(4 << 20)?.as_slice()[0] = MaybeUninit::new(1);
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_3() -> Result<(), AllocError> {
-        initialize();
-        let until = Arc::new(AtomicBool::new(true));
-
-        let inner = || {
-            let until = Arc::clone(&until);
-            move || {
-                let mut i = 0;
-                let until = &*until;
-                while until.load(Ordering::Relaxed) {
-                    i += 1;
-                    let mut r = <Wrapper<u8>>::allocate(4 << 20).unwrap();
-                    r.as_slice()[0] = MaybeUninit::new(1);
-                }
-                println!("repetitions: {i}");
-            }
-        };
-        let handles = [
-            std::thread::spawn(inner()),
-            std::thread::spawn(inner()),
-            std::thread::spawn(inner()),
-            std::thread::spawn(inner()),
-        ];
-        std::thread::sleep(Duration::from_secs(4));
-        until.store(false, Ordering::Relaxed);
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        // std::thread::sleep(Duration::from_secs(600));
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_4() -> Result<(), AllocError> {
-        initialize();
-        let until = Arc::new(AtomicBool::new(true));
-
-        let inner = || {
-            let until = Arc::clone(&until);
-            move || {
-                let mut i = 0;
-                let until = &*until;
-                let batch = 64;
-                let mut buffer = Vec::with_capacity(batch);
-                while until.load(Ordering::Relaxed) {
-                    i += 64;
-                    buffer.extend((0..batch).map(|_| {
-                        let mut r = <Wrapper<u8>>::allocate(2 << 20).unwrap();
-                        r.as_slice()[0] = MaybeUninit::new(1);
-                        r
-                    }));
-                    buffer.clear();
-                }
-                println!("repetitions vec: {i}");
-            }
-        };
-        let handles = [
-            std::thread::spawn(inner()),
-            std::thread::spawn(inner()),
-            std::thread::spawn(inner()),
-            std::thread::spawn(inner()),
-        ];
-        std::thread::sleep(Duration::from_secs(4));
-        until.store(false, Ordering::Relaxed);
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        std::thread::sleep(Duration::from_secs(1));
-        let stats = lgalloc_stats();
-        for size_class in &stats.size_class {
-            println!("size_class {:?}", size_class);
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn leak() -> Result<(), AllocError> {
-        lgalloc_set_config(&LgAlloc {
-            enabled: Some(true),
-            path: Some(std::env::temp_dir()),
-            ..Default::default()
-        });
-        let r = <Wrapper<u8>>::allocate(1 << 20)?;
-
-        let thread = std::thread::spawn(move || drop(r));
-
-        thread.join().unwrap();
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_zst() -> Result<(), AllocError> {
-        initialize();
-        <Wrapper<()>>::allocate(10)?;
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_zero_capacity_zst() -> Result<(), AllocError> {
-        initialize();
-        <Wrapper<()>>::allocate(0)?;
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_zero_capacity_nonzst() -> Result<(), AllocError> {
-        initialize();
-        <Wrapper<()>>::allocate(0)?;
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_stats() -> Result<(), AllocError> {
-        initialize();
-        let (_ptr, _cap, handle) = allocate::<usize>(1024)?;
-        deallocate(handle);
-
-        let stats = lgalloc_stats();
-
-        assert!(!stats.size_class.is_empty());
-
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_disable() {
-        lgalloc_set_config(&*LgAlloc::new().disable());
-        assert!(matches!(allocate::<u8>(1024), Err(AllocError::Disabled)));
     }
 }
