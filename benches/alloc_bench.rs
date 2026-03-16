@@ -25,9 +25,18 @@ struct SendPtr(*mut u8);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
+fn parse_arg_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1).cloned())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let run_paging = args.iter().any(|a| a == "--paging");
+    let run_ratio_sweep = args.iter().any(|a| a == "--ratio-sweep");
+    let total_mib: Option<usize> = parse_arg_value(&args, "--total-mib")
+        .and_then(|v| v.parse().ok());
 
     // Initialize lgalloc once.
     lgalloc::lgalloc_set_config(
@@ -41,8 +50,13 @@ fn main() {
             }),
     );
 
+    if run_ratio_sweep {
+        bench_ratio_sweep(total_mib);
+        return;
+    }
+
     if run_paging {
-        bench_paging();
+        bench_paging(total_mib);
         return;
     }
 
@@ -403,11 +417,461 @@ fn bench_mmap_madvise_free(running: &AtomicBool, hist: &mut HdrHistogram<u64>) {
 // Allocates more memory than available RAM, touches all of it, then measures
 // random access latency as pages get swapped in/out.
 
-fn bench_paging() {
+// --- Shared helpers for ratio sweep ---
+
+fn print_result(
+    name: &str,
+    threads: usize,
+    mem_limit: usize,
+    total_bytes: usize,
+    ratio_label: &str,
+    elapsed: Duration,
+    hist: &HdrHistogram<u64>,
+) {
+    println!(
+        "{:<25} ram_mib={}  ws_mib={}  ratio={:<10} thr={:<2}  ops={:<10}  avg={:<10} p50={:<10} p99={:<10} p999={:<10} max={}",
+        name,
+        mem_limit >> 20,
+        total_bytes >> 20,
+        ratio_label,
+        threads,
+        (hist.len() as f64 / elapsed.as_secs_f64()) as u64,
+        format_ns(hist.mean() as u64),
+        format_ns(hist.value_at_quantile(0.5)),
+        format_ns(hist.value_at_quantile(0.99)),
+        format_ns(hist.value_at_quantile(0.999)),
+        format_ns(hist.max()),
+    );
+}
+
+/// Plain random read (no madvise tricks).
+#[allow(clippy::too_many_arguments)]
+fn run_random_read(
+    name: &str,
+    threads: usize,
+    page_addrs: &Arc<Vec<SendPtr>>,
+    measure_secs: u64,
+    warmup_ms: u64,
+    mem_limit: usize,
+    total_bytes: usize,
+    ratio_label: &str,
+) {
+    let running = Arc::new(AtomicBool::new(true));
+    let shared_hist = Arc::new(SharedHistogram::new());
+    let barrier = Arc::new(Barrier::new(threads + 1));
+
+    let handles: Vec<_> = (0..threads)
+        .map(|t| {
+            let running = Arc::clone(&running);
+            let shared_hist = Arc::clone(&shared_hist);
+            let barrier = Arc::clone(&barrier);
+            let page_addrs = Arc::clone(page_addrs);
+            std::thread::spawn(move || {
+                let mut hist = SharedHistogram::recorder();
+                barrier.wait();
+                let n = page_addrs.len();
+                let stride = 104_729;
+                let mut idx = (t * 7919) % n;
+                while running.load(Ordering::Relaxed) {
+                    let start = Instant::now();
+                    let val = unsafe { std::ptr::read_volatile(page_addrs[idx].0) };
+                    black_box(val);
+                    let _ = hist.record(start.elapsed().as_nanos() as u64);
+                    idx = (idx + stride) % n;
+                }
+                shared_hist.merge(hist);
+            })
+        })
+        .collect();
+
+    barrier.wait();
+    std::thread::sleep(Duration::from_millis(warmup_ms));
+    shared_hist.reset();
+
+    let start = Instant::now();
+    std::thread::sleep(Duration::from_secs(measure_secs));
+    running.store(false, Ordering::SeqCst);
+    for h in handles {
+        h.join().unwrap();
+    }
+    let elapsed = start.elapsed();
+    let hist = shared_hist.combined();
+    print_result(name, threads, mem_limit, total_bytes, ratio_label, elapsed, &hist);
+}
+
+/// Random read with a dedicated prefetch thread that runs `distance` pages ahead
+/// issuing MADV_WILLNEED on each page.
+#[allow(clippy::too_many_arguments)]
+fn run_prefetch_read(
+    name: &str,
+    threads: usize,
+    page_addrs: &Arc<Vec<SendPtr>>,
+    measure_secs: u64,
+    warmup_ms: u64,
+    mem_limit: usize,
+    total_bytes: usize,
+    ratio_label: &str,
+    distance: usize,
+) {
+    let running = Arc::new(AtomicBool::new(true));
+    let shared_hist = Arc::new(SharedHistogram::new());
+    // +1 for main thread coordination, +threads for prefetch threads (one per reader)
+    let barrier = Arc::new(Barrier::new(threads * 2 + 1));
+
+    let handles: Vec<_> = (0..threads)
+        .flat_map(|t| {
+            let running_r = Arc::clone(&running);
+            let running_p = Arc::clone(&running);
+            let shared_hist = Arc::clone(&shared_hist);
+            let barrier_r = Arc::clone(&barrier);
+            let barrier_p = Arc::clone(&barrier);
+            let addrs_r = Arc::clone(page_addrs);
+            let addrs_p = Arc::clone(page_addrs);
+            let n = page_addrs.len();
+            let stride = 104_729;
+            let start_idx = (t * 7919) % n;
+
+            // Prefetch thread: runs `distance` steps ahead of the reader.
+            let prefetcher = std::thread::spawn(move || {
+                barrier_p.wait();
+                let mut idx = start_idx;
+                // Jump ahead by `distance` steps.
+                for _ in 0..distance {
+                    idx = (idx + stride) % n;
+                }
+                while running_p.load(Ordering::Relaxed) {
+                    let ptr = addrs_p[idx].0;
+                    unsafe { libc::madvise(ptr.cast(), 4096, libc::MADV_WILLNEED) };
+                    idx = (idx + stride) % n;
+                    // Yield occasionally so we don't spin too far ahead.
+                    std::thread::yield_now();
+                }
+            });
+
+            // Reader thread: same traversal pattern.
+            let reader = std::thread::spawn(move || {
+                let mut hist = SharedHistogram::recorder();
+                barrier_r.wait();
+                let mut idx = start_idx;
+                while running_r.load(Ordering::Relaxed) {
+                    let start = Instant::now();
+                    let val = unsafe { std::ptr::read_volatile(addrs_r[idx].0) };
+                    black_box(val);
+                    let _ = hist.record(start.elapsed().as_nanos() as u64);
+                    idx = (idx + stride) % n;
+                }
+                shared_hist.merge(hist);
+            });
+
+            [prefetcher, reader]
+        })
+        .collect();
+
+    barrier.wait();
+    std::thread::sleep(Duration::from_millis(warmup_ms));
+    shared_hist.reset();
+
+    let start = Instant::now();
+    std::thread::sleep(Duration::from_secs(measure_secs));
+    running.store(false, Ordering::SeqCst);
+    for h in handles {
+        h.join().unwrap();
+    }
+    let elapsed = start.elapsed();
+    let hist = shared_hist.combined();
+    print_result(name, threads, mem_limit, total_bytes, ratio_label, elapsed, &hist);
+}
+
+/// Batch prefetch: WILLNEED `batch_size` pages, then read them all, measure total.
+#[allow(clippy::too_many_arguments)]
+fn run_batch_prefetch_read(
+    name: &str,
+    threads: usize,
+    page_addrs: &Arc<Vec<SendPtr>>,
+    measure_secs: u64,
+    warmup_ms: u64,
+    mem_limit: usize,
+    total_bytes: usize,
+    ratio_label: &str,
+    batch_size: usize,
+) {
+    let running = Arc::new(AtomicBool::new(true));
+    let shared_hist = Arc::new(SharedHistogram::new());
+    let barrier = Arc::new(Barrier::new(threads + 1));
+
+    let handles: Vec<_> = (0..threads)
+        .map(|t| {
+            let running = Arc::clone(&running);
+            let shared_hist = Arc::clone(&shared_hist);
+            let barrier = Arc::clone(&barrier);
+            let page_addrs = Arc::clone(page_addrs);
+            std::thread::spawn(move || {
+                let mut hist = SharedHistogram::recorder();
+                barrier.wait();
+                let n = page_addrs.len();
+                let stride = 104_729;
+                let mut idx = (t * 7919) % n;
+                while running.load(Ordering::Relaxed) {
+                    // Phase 1: issue WILLNEED for the whole batch.
+                    let batch_start_idx = idx;
+                    for _ in 0..batch_size {
+                        let ptr = page_addrs[idx].0;
+                        unsafe { libc::madvise(ptr.cast(), 4096, libc::MADV_WILLNEED) };
+                        idx = (idx + stride) % n;
+                    }
+                    // Phase 2: read them all, measuring per-page latency.
+                    idx = batch_start_idx;
+                    for _ in 0..batch_size {
+                        let start = Instant::now();
+                        let val = unsafe { std::ptr::read_volatile(page_addrs[idx].0) };
+                        black_box(val);
+                        let _ = hist.record(start.elapsed().as_nanos() as u64);
+                        idx = (idx + stride) % n;
+                    }
+                }
+                shared_hist.merge(hist);
+            })
+        })
+        .collect();
+
+    barrier.wait();
+    std::thread::sleep(Duration::from_millis(warmup_ms));
+    shared_hist.reset();
+
+    let start = Instant::now();
+    std::thread::sleep(Duration::from_secs(measure_secs));
+    running.store(false, Ordering::SeqCst);
+    for h in handles {
+        h.join().unwrap();
+    }
+    let elapsed = start.elapsed();
+    let hist = shared_hist.combined();
+    print_result(name, threads, mem_limit, total_bytes, ratio_label, elapsed, &hist);
+}
+
+// --- Ratio sweep benchmark ---
+// Allocates a fixed working set, touches it all into swap, then measures
+// random read and realloc+touch at the current cgroup memory ratio.
+// Designed to be invoked repeatedly with different MemoryMax values.
+
+fn bench_ratio_sweep(total_mib: Option<usize>) {
+    let mem_limit = read_cgroup_memory_limit().unwrap_or(512 << 20);
+    let total_bytes = total_mib.map(|m| m << 20).unwrap_or(4 << 30);
+    let num_regions = total_bytes / REGION_SIZE;
+    let ratio_label = if mem_limit >= total_bytes {
+        "all fits".to_string()
+    } else {
+        format!("1:{:.1}", total_bytes as f64 / mem_limit as f64)
+    };
+
+    eprintln!(
+        "=== ratio sweep: RAM={} MiB, working_set={} MiB ({} regions), ratio={} ===",
+        mem_limit >> 20,
+        total_bytes >> 20,
+        num_regions,
+        ratio_label,
+    );
+
+    // Phase 1: Allocate and touch everything to push into swap.
+    let mut regions: Vec<_> = (0..num_regions)
+        .map(|_| lgalloc::allocate::<u8>(REGION_SIZE).unwrap())
+        .collect();
+
+    let touch_start = Instant::now();
+    for (ptr, cap, _handle) in &regions {
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), *cap) };
+        for i in (0..slice.len()).step_by(4096) {
+            unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+        }
+    }
+    let touch_elapsed = touch_start.elapsed();
+    eprintln!(
+        "  touch: {:.1}ms ({:.0} MiB/s)",
+        touch_elapsed.as_secs_f64() * 1000.0,
+        (total_bytes as f64 / (1 << 20) as f64) / touch_elapsed.as_secs_f64(),
+    );
+
+    // Phase 2: madvise strategy experiments for random reads.
+    let measure_secs = 10;
+    let warmup_ms = 500;
+
+    let page_addrs: Arc<Vec<SendPtr>> = {
+        let mut addrs = Vec::new();
+        for (ptr, cap, _) in &regions {
+            let base = ptr.as_ptr();
+            for offset in (0..*cap).step_by(4096) {
+                addrs.push(SendPtr(unsafe { base.add(offset) }));
+            }
+        }
+        Arc::new(addrs)
+    };
+
+    // Helper: apply madvise to all regions.
+    let madvise_all = |advice: libc::c_int| {
+        for (ptr, cap, _) in &regions {
+            unsafe { libc::madvise(ptr.as_ptr().cast(), *cap, advice) };
+        }
+    };
+
+    // --- Strategy A: baseline random reads (default kernel policy) ---
+    for &threads in THREAD_COUNTS {
+        run_random_read(
+            "rand_baseline",
+            threads,
+            &page_addrs,
+            measure_secs,
+            warmup_ms,
+            mem_limit,
+            total_bytes,
+            &ratio_label,
+        );
+    }
+
+    // --- Strategy B: MADV_RANDOM — tell kernel our access is random, disable readahead ---
+    #[cfg(target_os = "linux")]
+    {
+        madvise_all(libc::MADV_RANDOM);
+        for &threads in THREAD_COUNTS {
+            run_random_read(
+                "rand+RANDOM",
+                threads,
+                &page_addrs,
+                measure_secs,
+                warmup_ms,
+                mem_limit,
+                total_bytes,
+                &ratio_label,
+            );
+        }
+        // Reset to default.
+        madvise_all(libc::MADV_NORMAL);
+    }
+
+    // --- Strategy C: MADV_SEQUENTIAL — aggressive readahead (counterintuitive for random) ---
+    #[cfg(target_os = "linux")]
+    {
+        madvise_all(libc::MADV_SEQUENTIAL);
+        for &threads in THREAD_COUNTS {
+            run_random_read(
+                "rand+SEQUENTIAL",
+                threads,
+                &page_addrs,
+                measure_secs,
+                warmup_ms,
+                mem_limit,
+                total_bytes,
+                &ratio_label,
+            );
+        }
+        madvise_all(libc::MADV_NORMAL);
+    }
+
+    // --- Strategy D: prefetch thread runs ahead with MADV_WILLNEED ---
+    for &threads in THREAD_COUNTS {
+        run_prefetch_read(
+            "rand+prefetch",
+            threads,
+            &page_addrs,
+            measure_secs,
+            warmup_ms,
+            mem_limit,
+            total_bytes,
+            &ratio_label,
+            32, // prefetch distance in pages
+        );
+    }
+
+    // --- Strategy E: batch prefetch — WILLNEED a batch, then read them all ---
+    for &batch_size in &[8, 32, 128] {
+        let label = format!("rand+batch{batch_size}");
+        run_batch_prefetch_read(
+            &label,
+            1,
+            &page_addrs,
+            measure_secs,
+            warmup_ms,
+            mem_limit,
+            total_bytes,
+            &ratio_label,
+            batch_size,
+        );
+    }
+
+    // --- Strategy F: MADV_RANDOM + prefetch (best of both: no useless readahead + explicit prefetch) ---
+    #[cfg(target_os = "linux")]
+    {
+        madvise_all(libc::MADV_RANDOM);
+        for &threads in THREAD_COUNTS {
+            run_prefetch_read(
+                "rand+RANDOM+pf",
+                threads,
+                &page_addrs,
+                measure_secs,
+                warmup_ms,
+                mem_limit,
+                total_bytes,
+                &ratio_label,
+                32,
+            );
+        }
+        madvise_all(libc::MADV_NORMAL);
+    }
+
+    // Phase 3: Dealloc half, realloc+touch (single thread, just one data point).
+    let half = regions.len() / 2;
+    for (_ptr, _cap, handle) in regions.drain(..half) {
+        lgalloc::deallocate(handle);
+    }
+
+    {
+        let running = Arc::new(AtomicBool::new(true));
+        let shared_hist = Arc::new(SharedHistogram::new());
+
+        let r2 = Arc::clone(&running);
+        let sh2 = Arc::clone(&shared_hist);
+        let handle = std::thread::spawn(move || {
+            let mut hist = SharedHistogram::recorder();
+            while r2.load(Ordering::Relaxed) {
+                let start = Instant::now();
+                let (ptr, cap, h) = lgalloc::allocate::<u8>(REGION_SIZE).unwrap();
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), cap) };
+                for i in (0..slice.len()).step_by(4096) {
+                    unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+                }
+                black_box(slice);
+                lgalloc::deallocate(h);
+                let _ = hist.record(start.elapsed().as_nanos() as u64);
+            }
+            sh2.merge(hist);
+        });
+
+        std::thread::sleep(Duration::from_millis(warmup_ms));
+        shared_hist.reset();
+
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_secs(measure_secs));
+        running.store(false, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let elapsed = start.elapsed();
+        let hist = shared_hist.combined();
+        print_result(
+            "realloc_touch", 1, mem_limit, total_bytes, &ratio_label, elapsed, &hist,
+        );
+    }
+
+    // Cleanup
+    for (_ptr, _cap, handle) in regions.drain(..) {
+        lgalloc::deallocate(handle);
+    }
+}
+
+fn bench_paging(total_mib: Option<usize>) {
     // Read cgroup memory limit to determine how much RAM we have.
     let mem_limit = read_cgroup_memory_limit().unwrap_or(512 << 20);
-    // Allocate 3x the memory limit to guarantee swap pressure.
-    let total_bytes = mem_limit * 3;
+    let total_bytes = total_mib
+        .map(|m| m << 20)
+        .unwrap_or(mem_limit * 3);
     let num_regions = total_bytes / REGION_SIZE;
 
     println!("=== Paging benchmark ===");
@@ -562,9 +1026,22 @@ fn bench_paging() {
     }
 }
 
-/// Read cgroup v2 memory.max, falling back to cgroup v1.
+/// Read cgroup v2 memory.max for the current process's cgroup, falling back to cgroup v1.
 fn read_cgroup_memory_limit() -> Option<usize> {
-    // cgroup v2
+    // Find our own cgroup path from /proc/self/cgroup
+    let cgroup_path = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    // cgroup v2: line starts with "0::" followed by the path
+    for line in cgroup_path.lines() {
+        if let Some(path) = line.strip_prefix("0::") {
+            let memory_max = format!("/sys/fs/cgroup{path}/memory.max");
+            if let Ok(content) = std::fs::read_to_string(&memory_max) {
+                if let Ok(limit) = content.trim().parse::<usize>() {
+                    return Some(limit);
+                }
+            }
+        }
+    }
+    // Fallback: fixed path (works if already in the right cgroup)
     if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
         if let Ok(limit) = content.trim().parse::<usize>() {
             return Some(limit);

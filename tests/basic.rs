@@ -121,3 +121,33 @@ fn stats() -> Result<(), AllocError> {
 
     Ok(())
 }
+
+#[test]
+fn prefetch() -> Result<(), AllocError> {
+    initialize();
+    let (ptr, cap, handle) = allocate::<u8>(2 << 20)?;
+
+    // Prefetch the whole region.
+    handle.prefetch(0, cap)?;
+
+    // Prefetch a sub-range (first 64 KiB).
+    handle.prefetch(0, 64 * 1024)?;
+
+    // Prefetch an interior offset.
+    handle.prefetch(4096, 4096)?;
+
+    // Zero-length is a no-op.
+    handle.prefetch(0, 0)?;
+
+    // Out of bounds returns an error.
+    assert!(handle.prefetch(0, cap + 1).is_err());
+    assert!(handle.prefetch(cap, 1).is_err());
+
+    // Verify the memory is accessible.
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), cap) };
+    slice[0] = 42;
+    assert_eq!(slice[0], 42);
+
+    deallocate(handle);
+    Ok(())
+}

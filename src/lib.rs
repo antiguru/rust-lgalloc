@@ -99,6 +99,38 @@ impl Handle {
         unsafe { self.madvise(libc::MADV_DONTNEED) }
     }
 
+    /// Hint to the kernel that a byte range within this allocation will be needed soon.
+    ///
+    /// Issues `MADV_WILLNEED` to initiate asynchronous page-in for the range
+    /// `[offset, offset + len)`, which is especially useful when pages may reside in
+    /// swap. The kernel begins reading pages in the background; a subsequent access to
+    /// a prefetched page will either find it already resident or wait for a shorter I/O.
+    ///
+    /// `offset` and `len` do not need to be page-aligned — the kernel rounds to page
+    /// boundaries internally.
+    ///
+    /// This is a performance hint and never affects correctness. The kernel may ignore
+    /// it under memory pressure. Calling it on already-resident pages is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllocError::OutOfMemory`] if `offset + len` exceeds the allocation length.
+    pub fn prefetch(&self, offset: usize, len: usize) -> Result<(), AllocError> {
+        if len == 0 || self.is_dangling() {
+            return Ok(());
+        }
+        if offset.saturating_add(len) > self.len {
+            return Err(AllocError::OutOfMemory);
+        }
+        // SAFETY: MADV_WILLNEED is a hint that never modifies memory contents.
+        // The pointer arithmetic is in-bounds per the check above.
+        unsafe {
+            let ptr = self.as_non_null().as_ptr().add(offset);
+            libc::madvise(ptr.cast(), len, libc::MADV_WILLNEED);
+        }
+        Ok(())
+    }
+
     /// Call `madvise` on the memory region. Unsafe because `advice` is passed verbatim.
     unsafe fn madvise(&self, advice: libc::c_int) -> std::io::Result<()> {
         // SAFETY: Calling into `madvise`:
@@ -685,6 +717,7 @@ pub fn deallocate(handle: Handle) {
     }
     thread_context(|s| s.deallocate(handle));
 }
+
 
 /// A background worker that performs periodic tasks.
 struct BackgroundWorker {
