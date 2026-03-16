@@ -1,4 +1,4 @@
-//! Example that shows the disk usage for lgalloc.
+//! Example that demonstrates lgalloc's anonymous memory allocations with THP hints.
 fn main() {
     let buffer_size = 32 << 20;
 
@@ -7,7 +7,6 @@ fn main() {
     let mut config = lgalloc::LgAlloc::new();
     config.enable();
     config.eager_return(true);
-    config.with_path(std::env::temp_dir());
     lgalloc::lgalloc_set_config(&config);
 
     println!("Allocating {buffers} regions of {buffer_size} size...");
@@ -43,15 +42,15 @@ fn main() {
 }
 
 fn print_stats() {
-    let stats = lgalloc::lgalloc_stats_with_mapping().unwrap();
+    let stats = lgalloc::lgalloc_stats();
 
-    for (size_class, file_stats) in &stats.file {
-        match file_stats {
-            Ok(file_stats) => println!("file_stats {size_class} {file_stats:?}"),
-            Err(e) => eprintln!("Failed to read file stats for size class {size_class}: {e}"),
+    for (size_class, stats) in &stats.size_class {
+        if stats.areas > 0 {
+            println!(
+                "size_class {size_class}: areas={}, total_bytes={}, free={}, clean={}, global={}, thread={}",
+                stats.areas, stats.area_total_bytes, stats.free_regions, stats.clean_regions,
+                stats.global_regions, stats.thread_regions,
+            );
         }
-    }
-    for (size_class, map_stats) in stats.map.iter().flatten() {
-        println!("map_stats {size_class} {map_stats:?}");
     }
 }

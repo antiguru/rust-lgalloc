@@ -1,7 +1,8 @@
 lgalloc
 =======
 
-A memory allocator for large objects. Lgalloc stands for large (object) allocator.
+A memory allocator for large objects backed by anonymous mappings with huge page hints.
+Lgalloc stands for large (object) allocator.
 We spell it `lgalloc` and pronounce it el-gee-alloc.
 
 ```toml
@@ -16,8 +17,7 @@ use std::mem::ManuallyDrop;
 fn main() -> Result<(), lgalloc::AllocError> {
   lgalloc::lgalloc_set_config(
     lgalloc::LgAlloc::new()
-      .enable()
-      .with_path(std::env::temp_dir()),
+      .enable(),
   );
 
   // Allocate memory
@@ -38,84 +38,71 @@ fn main() -> Result<(), lgalloc::AllocError> {
 }
 ```
 
-## Details
+## When to use lgalloc
 
-Lgalloc is a memory allocator that backs allocations with memory-mapped sparse files.
-It is size-classed, meaning that it can only allocate memory in power-of-two sized regions, and each region
-is independent of the others. Each region is backed by files of increasing size.
+Lgalloc is designed for programs that allocate and recycle many large memory regions (2 MiB+).
+It pools regions by size class and reuses them without returning virtual address space to the kernel, which avoids the `mmap`/`munmap` overhead and kernel `mmap_lock` contention that dominate at high thread counts.
+On Linux, it requests transparent huge pages via `MADV_HUGEPAGE`, reducing TLB misses for large working sets.
 
-Memory mapped files allow the operating system to evict pages from the page cache under memory pressure,
-thus enabling some form of paging without using swap space. This is useful in environments where
-swapping is not available (e.g, Kubernetes), or where the application wants to retain control over
-which pages can be evicted.
+Lgalloc is a low-level API.
+Callers get a raw pointer, a capacity, and a handle; they are responsible for building higher-level abstractions (vectors, buffers) on top.
 
-Lgalloc provides a low-level API, but does not expose a high-level interface. Clients are advised to
-implement their own high-level abstractions, such as vectors or other data structures, on top of
-lgalloc.
+## Usage constraints
 
-Memory mapped files have some properties that are not immediately obvious, and sometimes depend on the
-particular configuration of the operating system. The most important ones are:
-- Allocations do not use physical memory until they are touched. Once touched, they use physical memory
-  and equivalent space on disk. Linux allocates space on disk eagerly, but other operating systems
-  might not. This means that touching memory can cause I/O operations, which can be slow.
-- Returning memory is a two-step process. After deallocation, lgalloc tries to free the physical memory
-  by calling `MADV_DONTNEED`. It's not entirely clear what Linux does with this, but it seems to
-  remove the pages from the page cache, while leaving the disk allocation intact. Lgalloc offers an
-  optional background worker that periodically calls `MADV_FREE` on unused memory regions. This
-  punches holes into the underlying file, which allows the OS to reclaim disk space. Note that this
-  causes I/O operations, which can be slow.
-- Interacting with the memory subsystem can cause contention, especially when multiple threads
-  try to interact with the virtual address space at the same time. For example, reading the
-  `/proc/self/numa_maps` file can cause contention, as can the `mmap` and `madvise` system calls.
-  Other parts of the program, for example the allocator, might use syscalls that can contend with
-  lgalloc.
+* **No fork.**
+  Anonymous mappings are shared with child processes after `fork`.
+  Two processes writing to the same mapping causes undefined behavior.
+  There is no way to mark mappings as non-inheritable.
+* **No mlock.**
+  Callers must not lock pages (`mlock`) on regions managed by lgalloc, or must unlock them before returning the region.
+  The background worker calls `madvise` on returned regions, which fails on locked pages.
+* **Do not free with another allocator.**
+  Memory obtained from `allocate` must be returned via `deallocate`.
+  Passing the pointer to `free`, `Vec::from_raw_parts` without `ManuallyDrop`, or any other allocator is undefined behavior.
+* **Minimum allocation is 2 MiB.**
+  Size classes range from 2^21 (2 MiB) to 2^36 (64 GiB).
+  Requests below 2 MiB return `AllocError::InvalidSizeClass`.
+* **Capacity may be rounded up.**
+  The returned capacity can be larger than requested because allocations are rounded to power-of-two size classes.
 
-- Lgalloc provides an allocator for power-of-two sized memory regions, with an optional dampener.
-- The requested capacity can be rounded up to a larger capacity.
-- The memory can be repurposed, for example to back a vector, however, the caller needs to be
-  careful never to free the memory using another allocator.
-- Memory is not unmapped, but can be lazily marked as unused with a background thread. The exact
-  options for this still need to be determined.
-- The allocations are mapped from a file, which allows the OS to page without using swap.
-- On Linux, this means it can only handle regular pages (4KiB), the region cannot be mapped
-  with huge pages.
-- The library does not consume physical memory when all regions are freed, but pollutes the
-  virtual address space because it doesn't unmap regions. This is because the library does
-  not keep track what parts of a mapping are still in use. (Its internal structures always
-  require memory.)
-- Generally, use at your own risk because nobody should write a memory allocator.
-- Performance seems to be reasonable, similar to the system allocator when not touching the data,
-  and faster when touching the data. The reason is that this library does not unmap its regions.
+## Thread safety
 
+`Handle` is `Send` and `Sync`.
+Allocations can be made on one thread and freed on another.
+Each thread maintains a local cache; the global pool uses lock-free work-stealing to redistribute regions.
 
-The allocator tries to minimize contention. It relies on thread-local allocations and a
-work-stealing pattern to move allocations between threads. Each size class acts as its own
-allocator. However, some system calls can contend on mapping objects, which is why reclamation
-and gathering stats can cause contention.
+## How it works
 
-We use the term region for a power-of-two sized allocation, and area for a contiguous allocations.
-Each area can back multiple regions.
+Lgalloc is size-classed: each power-of-two size from 2 MiB to 64 GiB has its own pool.
+Within a size class, contiguous *areas* of increasing size back individual *regions*.
 
-* Each thread maintains a bounded cache of regions.
-* If on allocation the cache is empty, it checks the global pool first, and then other threads.
-* The global pool has a dirty and clean variant. Dirty contains allocations that were recently
-  recycled, and clean contains allocations that we marked as not needed/removed to the OS.
-* An optional background worker periodically moves allocations from dirty to clean.
-* Lgalloc makes heavy use of `crossbeam-deque`, which provides a lock-free work stealing API.
-* Refilling areas is a synchronous operation. It requires to create a file, allocate space, and
-  map its contents. We double the size of the allocation each time a size class is empty.
-* Lgalloc reports metrics about allocations, deallocations, and refills, and about the files it
-  owns, if the platform supports it.
+* Each thread maintains a bounded local cache of regions.
+* On allocation, the thread checks its local cache, then the global dirty pool, then the global clean pool, then steals from other threads.
+* On deallocation, the region goes to the local cache or, if full, to the global dirty pool.
+  With `eager_return` enabled, `MADV_DONTNEED` is called before pushing to the global pool.
+* An optional background worker moves dirty regions to the clean pool by calling `MADV_FREE` (Linux) or `MADV_DONTNEED` (other platforms), which marks pages as lazily reclaimable.
+* When all pools are empty, lgalloc creates a new area via `mmap(MAP_ANONYMOUS)` and applies `MADV_HUGEPAGE`.
+  Area sizes double on each refill, controlled by the `growth_dampener` config.
+* Regions are never unmapped during normal operation.
+  This avoids `munmap` syscall overhead but grows virtual address space.
+  Areas are unmapped when the global state is dropped (process exit).
+
+## Platform notes
+
+* **Linux**: requests transparent huge pages via `MADV_HUGEPAGE`.
+  The kernel uses 2 MiB pages when `/sys/kernel/mm/transparent_hugepage/enabled` is `always` or `madvise`.
+  If THP is disabled, the hint is silently ignored (one warning on stderr).
+* **macOS ARM**: the kernel does not expose a userspace huge page API.
+  Lgalloc uses the base 16 KiB page size.
 
 ## To do
 
 * Testing is very limited.
-* Allocating areas of doubling sizes seems to stress the `mmap` system call. Consider a different
-  strategy, such as constant-sized blocks or a limit on what areas we allocate. There's probably
-  a trade-off between area size and number of areas.
+* Allocating areas of doubling sizes seems to stress the `mmap` system call.
+  Consider a different strategy, such as constant-sized blocks or a limit on what areas we allocate.
+  There's probably a trade-off between area size and number of areas.
 * Fixed-size areas could allow us to move areas between size classes.
-* Reference-counting can determine when an area isn't referenced anymore, although this is not
-  trivial because it's a lock-free system.
+* Reference-counting can determine when an area isn't referenced anymore, although this is not trivial because it's a lock-free system.
 
 #### License
 
