@@ -44,9 +44,11 @@ requests transparent huge pages (THP) via `MADV_HUGEPAGE`.
 It is size-classed, meaning that it can only allocate memory in power-of-two sized regions, and each region
 is independent of the others. Each region is backed by areas of increasing size.
 
-Anonymous mappings with THP hints allow the kernel to use 2 MiB huge pages, reducing TLB
-pressure for large allocations. The kernel promotes pages to huge pages transparently when
-`/sys/kernel/mm/transparent_hugepage/enabled` is set to `always` or `madvise`.
+On Linux, anonymous mappings with THP hints allow the kernel to use 2 MiB huge pages,
+reducing TLB pressure for large allocations. The kernel promotes pages to huge pages
+transparently when `/sys/kernel/mm/transparent_hugepage/enabled` is set to `always` or
+`madvise`. On macOS ARM, the kernel does not expose a userspace huge page API, so lgalloc
+uses the base 16 KiB page size.
 
 Lgalloc provides a low-level API, but does not expose a high-level interface. Clients are advised to
 implement their own high-level abstractions, such as vectors or other data structures, on top of
@@ -69,6 +71,7 @@ Anonymous mappings have some properties that are not immediately obvious:
 * Memory is not unmapped during normal operation, but can be lazily marked as unused with a
   background thread.
 * On Linux with THP enabled, allocations can benefit from 2 MiB huge pages, reducing TLB misses.
+  On macOS ARM, huge pages are not available and the base 16 KiB page size is used.
 * The library does not consume physical memory when all regions are freed, but pollutes the
   virtual address space because it doesn't unmap regions during normal operation. Mappings are
   unmapped when the global state is dropped.
@@ -104,7 +107,6 @@ Each area can back multiple regions.
 * Fixed-size areas could allow us to move areas between size classes.
 * Reference-counting can determine when an area isn't referenced anymore, although this is not
   trivial because it's a lock-free system.
-* Support superpages on macOS (`VM_FLAGS_SUPERPAGE_SIZE_2MB` via `mach/vm_statistics.h`).
 
 #### License
 
